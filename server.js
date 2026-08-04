@@ -66,7 +66,7 @@ const SENSITIVE_HINTS = [
 const HARD_STOP_HINTS = ['mineur', 'enfant', 'collégien', 'lycéen', ' ado '];
 
 async function callStaan(name) {
-  if (!STAAN_API_KEY) return [];
+  if (!STAAN_API_KEY) { console.warn('STAAN_API_KEY absente — source Staan ignorée'); return []; }
   try {
     const res = await fetch('https://api.staan.ai/v1/search', {
       method: 'POST',
@@ -74,15 +74,18 @@ async function callStaan(name) {
         Authorization: `Bearer ${STAAN_API_KEY}`,
         'Content-Type': 'application/json',
       },
-      body: JSON.stringify({ query: `"${name}"`, count: 10 }),
+      body: JSON.stringify({ query: name, count: 10 }),
     });
-    if (!res.ok) return [];
+    if (!res.ok) {
+      const body = await res.text().catch(() => '');
+      console.warn(`Staan a répondu ${res.status} : ${body.slice(0, 300)}`);
+      return [];
+    }
     const data = await res.json();
-    return (data.results || []).map((r) => ({
-      title: r.title,
-      url: r.url,
-      snippet: r.snippet || r.description || '',
-      source: 'Staan',
+    const hits = data.results || data.hits || data.items || [];
+    if (hits.length === 0) console.warn('Staan : réponse OK mais 0 résultat extrait — forme de réponse à vérifier :', JSON.stringify(data).slice(0, 300));
+    return hits.map((r) => ({
+      title: r.title, url: r.url, snippet: r.snippet || r.description || '', source: 'Staan',
     }));
   } catch (err) {
     console.warn('Staan indisponible :', err.message);
@@ -91,19 +94,22 @@ async function callStaan(name) {
 }
 
 async function callBrave(name) {
-  if (!BRAVE_API_KEY) return [];
+  if (!BRAVE_API_KEY) { console.warn('BRAVE_API_KEY absente — source Brave ignorée'); return []; }
   try {
-    const url = `https://api.search.brave.com/res/v1/web/search?q=${encodeURIComponent(`"${name}"`)}&count=10`;
+    const url = `https://api.search.brave.com/res/v1/web/search?q=${encodeURIComponent(name)}&count=10`;
     const res = await fetch(url, {
       headers: { Accept: 'application/json', 'X-Subscription-Token': BRAVE_API_KEY },
     });
-    if (!res.ok) return [];
+    if (!res.ok) {
+      const body = await res.text().catch(() => '');
+      console.warn(`Brave a répondu ${res.status} : ${body.slice(0, 300)}`);
+      return [];
+    }
     const data = await res.json();
-    return (data.web?.results || []).map((r) => ({
-      title: r.title,
-      url: r.url,
-      snippet: r.description || '',
-      source: 'Brave',
+    const hits = data.web?.results || [];
+    if (hits.length === 0) console.warn('Brave : réponse OK mais 0 résultat extrait — forme de réponse à vérifier :', JSON.stringify(data).slice(0, 300));
+    return hits.map((r) => ({
+      title: r.title, url: r.url, snippet: r.description || '', source: 'Brave',
     }));
   } catch (err) {
     console.warn('Brave indisponible :', err.message);
