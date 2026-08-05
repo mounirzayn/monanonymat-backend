@@ -3,10 +3,8 @@
 // Sources interrogées :
 //  - Staan (Qwant / Ecosia) — index de recherche européen, self-service depuis juin 2026
 //    https://staan.ai — 1€/1000 requêtes, 1000 gratuites/mois.
-//    ⚠️ Le format exact de requête/réponse ci-dessous est une hypothèse raisonnable,
-//    pas une copie de la doc officielle (API trop récente pour que je l'aie en mémoire
-//    de façon fiable). Vérifie le contrat exact sur staan.ai avant de déployer, et
-//    ajuste callStaan() en conséquence.
+//    Endpoint confirmé via docs.staan.ai : POST https://api.staan.ai/v2/search/web,
+//    body { q, market }, header Authorization: Bearer <clé>.
 //  - Brave Search API — index indépendant. https://brave.com/search/api
 //    (le free tier a été supprimé en février 2026 — prévoir un budget, environ
 //    3 à 5€ pour 1000 requêtes selon l'endpoint)
@@ -68,13 +66,13 @@ const HARD_STOP_HINTS = ['mineur', 'enfant', 'collégien', 'lycéen', ' ado '];
 async function callStaan(name) {
   if (!STAAN_API_KEY) { console.warn('STAAN_API_KEY absente — source Staan ignorée'); return { hits: [], status: 'no_key' }; }
   try {
-    const res = await fetch('https://api.staan.ai/v1/search', {
+    const res = await fetch('https://api.staan.ai/v2/search/web', {
       method: 'POST',
       headers: {
         Authorization: `Bearer ${STAAN_API_KEY}`,
         'Content-Type': 'application/json',
       },
-      body: JSON.stringify({ query: name, count: 20 }),
+      body: JSON.stringify({ q: name, market: 'fr-fr' }),
     });
     if (!res.ok) {
       const body = await res.text().catch(() => '');
@@ -115,6 +113,38 @@ async function callBrave(name) {
     };
   } catch (err) {
     console.warn('Brave indisponible :', err.message);
+    return { hits: [], status: 'error' };
+  }
+}
+
+// Serper (serper.dev) — service commercial qui interroge Google et renvoie le
+// résultat en JSON. 2 500 requêtes gratuites offertes au départ, puis payant.
+// Ce n'est PAS un contournement de l'API Google fermée : c'est un prestataire
+// tiers dont c'est le métier, qui assume la conformité de son côté.
+const SERPER_API_KEY = process.env.SERPER_API_KEY;
+
+async function callSerper(name) {
+  if (!SERPER_API_KEY) { console.warn('SERPER_API_KEY absente — source Google (via Serper) ignorée'); return { hits: [], status: 'no_key' }; }
+  try {
+    const res = await fetch('https://google.serper.dev/search', {
+      method: 'POST',
+      headers: { 'X-API-KEY': SERPER_API_KEY, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ q: name, num: 20, gl: 'fr', hl: 'fr' }),
+    });
+    if (!res.ok) {
+      const body = await res.text().catch(() => '');
+      console.warn(`Serper a répondu ${res.status} : ${body.slice(0, 300)}`);
+      return { hits: [], status: 'error' };
+    }
+    const data = await res.json();
+    const hits = data.organic || [];
+    if (hits.length === 0) console.warn('Serper : réponse OK mais 0 résultat extrait — forme de réponse à vérifier :', JSON.stringify(data).slice(0, 300));
+    return {
+      hits: hits.map((r) => ({ title: r.title, url: r.link, snippet: r.snippet || '', source: 'Google' })),
+      status: 'ok',
+    };
+  } catch (err) {
+    console.warn('Serper indisponible :', err.message);
     return { hits: [], status: 'error' };
   }
 }
@@ -203,15 +233,18 @@ function relevance(item, name) {
 // Logique de scan partagée entre /api/scan (aperçu) et /api/unlock (rapport
 // complet avec vraies descriptions, envoyé par email).
 async function performScan(name) {
-  const [staan, brave] = await Promise.all([callStaan(name), callBrave(name)]);
-  const merged = dedupe([...staan.hits, ...brave.hits])
+  const [staan, brave, serper] = await Promise.all([callStaan(name), callBrave(name), callSerper(name)]);
+  const merged = dedupe([...staan.hits, ...brave.hits, ...serper.hits])
     .map((r) => ({ ...r, confidence: relevance(r, name) }))
     .filter((r) => r.confidence !== 'none');
-  const partial = staan.status !== 'ok' || brave.status !== 'ok';
+  const partial = staan.status !== 'ok' || brave.status !== 'ok' || serper.status !== 'ok';
   const hardStop = hasHardStopSignal(merged);
   const classified = classify(merged);
   const score = computeScore(classified);
-  return { classified, score, partial, hardStop, coverage: { staan: staan.status, brave: brave.status } };
+  return {
+    classified, score, partial, hardStop,
+    coverage: { staan: staan.status, brave: brave.status, google: serper.status },
+  };
 }
 
 app.post('/api/scan', async (req, res) => {
