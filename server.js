@@ -120,34 +120,33 @@ async function callBrave(name) {
   }
 }
 
-// Serper (serper.dev) — service commercial qui interroge Google et renvoie le
-// résultat en JSON. 2 500 requêtes gratuites offertes au départ, puis payant.
-// Ce n'est PAS un contournement de l'API Google fermée : c'est un prestataire
-// tiers dont c'est le métier, qui assume la conformité de son côté.
-const SERPER_API_KEY = process.env.SERPER_API_KEY;
+// SerpApi (serpapi.com) — service commercial qui interroge Google et renvoie le
+// résultat en JSON. Requête en GET, clé passée en paramètre d'URL (pas en en-tête),
+// résultats sous "organic_results". Confirmé via leur documentation officielle et
+// plusieurs intégrations tierces indépendantes.
+const SERPAPI_API_KEY = process.env.SERPAPI_API_KEY || process.env.SERPER_API_KEY; // compat avec l'ancien nom de variable
 
-async function callSerper(name) {
-  if (!SERPER_API_KEY) { console.warn('SERPER_API_KEY absente — source Google (via Serper) ignorée'); return { hits: [], status: 'no_key' }; }
+async function callSerpApi(name) {
+  if (!SERPAPI_API_KEY) { console.warn('SERPAPI_API_KEY absente — source Google (via SerpApi) ignorée'); return { hits: [], status: 'no_key' }; }
   try {
-    const res = await fetch('https://google.serper.dev/search', {
-      method: 'POST',
-      headers: { 'X-API-KEY': SERPER_API_KEY, 'Content-Type': 'application/json' },
-      body: JSON.stringify({ q: name, num: 20, gl: 'fr', hl: 'fr' }),
+    const params = new URLSearchParams({
+      engine: 'google', q: name, api_key: SERPAPI_API_KEY, hl: 'fr', gl: 'fr',
     });
+    const res = await fetch(`https://serpapi.com/search.json?${params.toString()}`);
     if (!res.ok) {
       const body = await res.text().catch(() => '');
-      console.warn(`Serper a répondu ${res.status} : ${body.slice(0, 300)}`);
+      console.warn(`SerpApi a répondu ${res.status} : ${body.slice(0, 300)}`);
       return { hits: [], status: 'error' };
     }
     const data = await res.json();
-    const hits = data.organic || [];
-    if (hits.length === 0) console.warn('Serper : réponse OK mais 0 résultat extrait — forme de réponse à vérifier :', JSON.stringify(data).slice(0, 300));
+    const hits = data.organic_results || [];
+    if (hits.length === 0) console.warn('SerpApi : réponse OK mais 0 résultat extrait — forme de réponse à vérifier :', JSON.stringify(data).slice(0, 300));
     return {
       hits: hits.map((r) => ({ title: r.title, url: r.link, snippet: r.snippet || '', source: 'Google' })),
       status: 'ok',
     };
   } catch (err) {
-    console.warn('Serper indisponible :', err.message);
+    console.warn('SerpApi indisponible :', err.message);
     return { hits: [], status: 'error' };
   }
 }
@@ -236,7 +235,7 @@ function relevance(item, name) {
 // Logique de scan partagée entre /api/scan (aperçu) et /api/unlock (rapport
 // complet avec vraies descriptions, envoyé par email).
 async function performScan(name) {
-  const [staan, brave, serper] = await Promise.all([callStaan(name), callBrave(name), callSerper(name)]);
+  const [staan, brave, serper] = await Promise.all([callStaan(name), callBrave(name), callSerpApi(name)]);
   const merged = dedupe([...staan.hits, ...brave.hits, ...serper.hits])
     .map((r) => ({ ...r, confidence: relevance(r, name) }))
     .filter((r) => r.confidence !== 'none');
