@@ -257,6 +257,14 @@ app.post('/api/scan', async (req, res) => {
 
   const { classified, score, partial, hardStop, coverage } = await performScan(name);
 
+  // Si les trois sources sont indisponibles en même temps, un score "0/100"
+  // serait indiscernable d'un vrai résultat propre — ce serait mentir par
+  // omission. On renvoie une vraie erreur plutôt qu'un faux rapport rassurant.
+  const allDown = coverage.staan !== 'ok' && coverage.brave !== 'ok' && coverage.google !== 'ok';
+  if (allDown) {
+    return res.status(503).json({ error: 'Toutes les sources sont indisponibles pour le moment.' });
+  }
+
   if (hardStop) {
     // Aucun rapport n'est construit dans ce cas : redirection uniquement.
     return res.json({
