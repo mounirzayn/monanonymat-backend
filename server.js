@@ -232,8 +232,8 @@ function relevance(item, name) {
   return 'none';
 }
 
-// Logique de scan partagée entre /api/scan (aperçu) et /api/unlock (rapport
-// complet avec vraies descriptions, envoyé par email).
+// Logique de scan partagée — appelée par /api/scan, qui renvoie directement le rapport
+// complet, avec les vraies descriptions).
 async function performScan(name) {
   const [staan, brave, serper] = await Promise.all([callStaan(name), callBrave(name), callSerpApi(name)]);
   const merged = dedupe([...staan.hits, ...brave.hits, ...serper.hits])
@@ -269,95 +269,11 @@ app.post('/api/scan', async (req, res) => {
   stats.scanCount += 1;
   stats.scoreSum += score;
 
-  // Version "teaser" : pas de détail exploitable avant email + consentement.
-  const teaserResults = classified.slice(0, 6).map((r) => ({
-    type: guessType(r.url),
-    tag: guessSource(r.url),
-    year: '—',
-    sensitive: r.sensitive,
-    confidence: r.confidence,
-  }));
-
-  // Rien n'est stocké ici tant que /api/unlock n'a pas été appelé — rétention minimale.
-  res.json({ score, results: teaserResults, partial, coverage });
-});
-
-// --- Envoi d'email réel via Brevo (300 emails/jour gratuits, EU) ---
-const BREVO_API_KEY = process.env.BREVO_API_KEY;
-const BREVO_SENDER_EMAIL = process.env.BREVO_SENDER_EMAIL; // doit être un expéditeur vérifié sur Brevo
-const BREVO_SENDER_NAME = process.env.BREVO_SENDER_NAME || 'monanonymat.fr';
-
-async function sendReportEmail({ to, name, score, results }) {
-  if (!BREVO_API_KEY || !BREVO_SENDER_EMAIL) {
-    console.warn('BREVO_API_KEY ou BREVO_SENDER_EMAIL absente — email non envoyé.');
-    return { sent: false, reason: 'no_config' };
-  }
-  const rows = results.map((r) =>
-    `<tr><td style="padding:8px 0;border-top:1px solid #eee;">${r.sensitive ? '⚠️ Sensible' : r.type} — ${r.tag}</td>
-     <td style="padding:8px 0;border-top:1px solid #eee;">${(r.full || '').replace(/</g, '&lt;')}</td></tr>`
-  ).join('');
-  const html = `
-    <div style="font-family:sans-serif;max-width:560px;margin:0 auto;">
-      <h2>Votre rapport d'exposition — ${name}</h2>
-      <p>Score d'exposition : <b>${score}/100</b></p>
-      <table style="width:100%;border-collapse:collapse;">${rows}</table>
-      <p style="margin-top:24px;color:#666;font-size:13px;">
-        Ce rapport a été généré automatiquement par monanonymat.fr à partir de sources
-        de recherche publiques. Pour agir sur ces contenus, connectez-vous à votre compte.
-      </p>
-    </div>`;
-  try {
-    const res = await fetch('https://api.brevo.com/v3/smtp/email', {
-      method: 'POST',
-      headers: {
-        'api-key': BREVO_API_KEY,
-        'Content-Type': 'application/json',
-        Accept: 'application/json',
-      },
-      body: JSON.stringify({
-        sender: { name: BREVO_SENDER_NAME, email: BREVO_SENDER_EMAIL },
-        to: [{ email: to }],
-        subject: `Votre rapport d'exposition monanonymat.fr — ${score}/100`,
-        htmlContent: html,
-      }),
-    });
-    if (!res.ok) {
-      const body = await res.text().catch(() => '');
-      console.warn(`Brevo a répondu ${res.status} : ${body.slice(0, 300)}`);
-      return { sent: false, reason: 'api_error' };
-    }
-    return { sent: true };
-  } catch (err) {
-    console.warn('Brevo indisponible :', err.message);
-    return { sent: false, reason: 'unreachable' };
-  }
-}
-
-app.post('/api/unlock', async (req, res) => {
-  const { name, email, consent, ref } = req.body || {};
-  if (!consent) return res.status(400).json({ error: 'Consentement requis' });
-  if (!email || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
-    return res.status(400).json({ error: 'Email invalide' });
-  }
-  if (!name || name.length < 2 || name.length > 80) {
-    return res.status(400).json({ error: 'Nom invalide' });
-  }
-
-  // Tracking affiliation/apporteur d'affaires : le code de parrainage (ex. "mounir",
-  // ou le code d'un cabinet d'avocats partenaire) est rattaché au lead ici. À stocker
-  // avec le lead en base pour le calcul des commissions — voir affiliation/README.md.
-  if (ref) console.log(`Lead ${email} rattaché au code de parrainage : ${ref}`);
-
-  // On relance le scan pour obtenir les vraies descriptions détaillées (pas juste
-  // les catégories de l'aperçu) — pas de cache pour l'instant, donc deux appels
-  // aux sources au total pour un même scan. À optimiser avec un cache court-terme
-  // une fois le volume plus important.
-  const { classified, score, hardStop } = await performScan(name);
-  if (hardStop) {
-    return res.json({ hardStop: true, redirectTo: '/urgence' });
-  }
-
-  const fullResults = classified.map((r) => ({
+  // Rapport complet renvoyé directement — le scan est gratuit, pas de raison
+  // de garder les vraies descriptions derrière un email. Une seule requête
+  // aux sources par scan (avant, une deuxième requête relançait tout une
+  // fois), ce qui économise aussi le quota gratuit de Staan/Brave/SerpApi.
+  const results = classified.map((r) => ({
     type: guessType(r.url),
     tag: guessSource(r.url),
     year: '—',
@@ -366,17 +282,58 @@ app.post('/api/unlock', async (req, res) => {
     full: r.snippet || r.title || 'Contenu trouvé, description non disponible.',
   }));
 
-  const emailResult = await sendReportEmail({ to: email, name, score, results: fullResults });
-
-  // TODO avant prod :
-  //  - stocker le lead (nom, email, score, date, consentement) dans une base
-  //    hébergée en Europe (Scaleway, OVHcloud...) avec une politique de
-  //    rétention courte et documentée (registre de traitement RGPD)
-  //  - mettre en cache le résultat du scan (quelques minutes) pour éviter de
-  //    relancer Staan/Brave deux fois pour la même recherche
-
-  res.json({ ok: true, score, results: fullResults, emailSent: emailResult.sent });
+  res.json({ score, results, partial, coverage });
 });
+
+// --- Paiement (Stripe Checkout) ---
+// Les prix sont définis ICI, côté serveur, jamais envoyés par le client — sinon
+// n'importe qui pourrait modifier le montant avant paiement en trafiquant la requête.
+const Stripe = require('stripe');
+const STRIPE_SECRET_KEY = process.env.STRIPE_SECRET_KEY;
+const FRONTEND_URL = process.env.FRONTEND_URL || 'https://monanonymat.fr';
+const stripe = STRIPE_SECRET_KEY ? new Stripe(STRIPE_SECRET_KEY) : null;
+
+const OFFERS = {
+  ponctuelle: { name: 'Suppression ponctuelle', amount: 14900, mode: 'payment' },
+  veille: { name: 'Veille & Protection (mensuel)', amount: 1900, mode: 'subscription' },
+  premium: { name: 'Accompagnement Premium', amount: 34900, mode: 'payment' },
+};
+
+app.post('/api/checkout', async (req, res) => {
+  if (!stripe) return res.status(503).json({ error: 'Paiement non configuré (STRIPE_SECRET_KEY absente)' });
+  const { tier, ref } = req.body || {};
+  const offer = OFFERS[tier];
+  if (!offer) return res.status(400).json({ error: 'Offre inconnue' });
+
+  try {
+    const priceData = {
+      currency: 'eur',
+      product_data: { name: offer.name },
+      unit_amount: offer.amount,
+    };
+    if (offer.mode === 'subscription') priceData.recurring = { interval: 'month' };
+
+    const session = await stripe.checkout.sessions.create({
+      mode: offer.mode,
+      payment_method_types: ['card'],
+      line_items: [{ price_data: priceData, quantity: 1 }],
+      // Code de parrainage/apporteur d'affaires rattaché ici, au vrai moment où
+      // une commission se déclenche (achat effectif) — voir affiliation/README.md.
+      metadata: ref ? { ref } : undefined,
+      success_url: `${FRONTEND_URL}?paiement=succes`,
+      cancel_url: `${FRONTEND_URL}?paiement=annule`,
+    });
+    res.json({ url: session.url });
+  } catch (err) {
+    console.warn('Stripe indisponible :', err.message);
+    res.status(500).json({ error: 'Impossible de créer la session de paiement' });
+  }
+});
+
+// TODO avant prod : ajouter un endpoint webhook Stripe (/api/stripe-webhook) qui
+// écoute l'événement checkout.session.completed pour confirmer le paiement côté
+// serveur et déclencher la création réelle du dossier — ne jamais se fier
+// uniquement à la redirection success_url, qui peut être atteinte sans paiement réel.
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log(`monanonymat backend sur :${PORT}`));
