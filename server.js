@@ -18,20 +18,50 @@
 const express = require('express');
 const rateLimit = require('express-rate-limit');
 const cors = require('cors');
+const helmet = require('helmet');
 require('dotenv').config();
 
 const app = express();
 // Render est derrière un proxy inverse — sans ce réglage, express-rate-limit
 // ne peut pas identifier correctement chaque visiteur via X-Forwarded-For.
 app.set('trust proxy', 1);
-app.use(cors());
-app.use(express.json());
+
+// En-têtes de sécurité HTTP standard (X-Content-Type-Options, X-Frame-Options,
+// désactivation du X-Powered-By qui révèle la techno utilisée, etc.). CSP
+// désactivée ici : cette API ne sert pas de HTML, la CSP se règle plutôt côté
+// site statique (voir le fichier _headers de Netlify).
+app.use(helmet({ contentSecurityPolicy: false }));
+
+// CORS restreint aux vrais domaines du site — laissé ouvert à tous, n'importe
+// quel autre site pourrait appeler notre API et consommer notre quota gratuit
+// Staan/Brave/SerpApi sans qu'on le sache. ALLOWED_ORIGINS accepte une liste
+// séparée par des virgules (ex. "https://monanonymat.fr,https://www.monanonymat.fr").
+const ALLOWED_ORIGINS = (process.env.ALLOWED_ORIGINS || 'https://monanonymat.fr,https://www.monanonymat.fr,https://celadon-peony-3f05ff.netlify.app')
+  .split(',').map((s) => s.trim());
+app.use(cors({
+  origin(origin, callback) {
+    // "origin" est absent pour les appels directs (ex. curl, tests serveur à
+    // serveur) — on les laisse passer ; le filtrage vise les navigateurs.
+    if (!origin || ALLOWED_ORIGINS.includes(origin)) return callback(null, true);
+    callback(new Error('Origine non autorisée'));
+  },
+}));
+// Le parsing JSON est appliqué route par route (pas globalement) : le webhook
+// Stripe plus bas a besoin du corps brut de la requête pour vérifier la
+// signature — un parsing JSON global l'en empêcherait.
 
 // Anti-abus basique : limite les recherches par IP. Indispensable car l'outil peut
 // être utilisé pour chercher quelqu'un d'autre — la case de consentement côté front
 // est un premier filtre déclaratif, pas une vraie vérification d'identité.
 const scanLimiter = rateLimit({ windowMs: 60 * 1000, max: 5 });
 app.use('/api/scan', scanLimiter);
+
+// Même logique pour le paiement — sans ça, quelqu'un pourrait créer des
+// centaines de sessions Stripe par minute (spam, pas une perte d'argent en
+// soi puisqu'aucune carte n'est débitée sans action sur la page Stripe, mais
+// ça peut faire réagir la protection anti-fraude de Stripe pour rien).
+const checkoutLimiter = rateLimit({ windowMs: 60 * 1000, max: 10 });
+app.use('/api/checkout', checkoutLimiter);
 
 // --- Compteur réel, pas un chiffre inventé pour la preuve sociale ---
 // ⚠️ En mémoire : remis à zéro à chaque redémarrage du serveur. Sur le plan
@@ -249,7 +279,7 @@ async function performScan(name) {
   };
 }
 
-app.post('/api/scan', async (req, res) => {
+app.post('/api/scan', express.json({ limit: '10kb' }), async (req, res) => {
   const name = (req.body?.name || '').trim();
   if (!name || name.length < 2 || name.length > 80) {
     return res.status(400).json({ error: 'Nom invalide' });
@@ -307,7 +337,7 @@ const OFFERS = {
   premium: { name: 'Accompagnement Premium', amount: 34900, mode: 'payment' },
 };
 
-app.post('/api/checkout', async (req, res) => {
+app.post('/api/checkout', express.json({ limit: '10kb' }), async (req, res) => {
   if (!stripe) return res.status(503).json({ error: 'Paiement non configuré (STRIPE_SECRET_KEY absente)' });
   const { tier, ref } = req.body || {};
   const offer = OFFERS[tier];
@@ -338,10 +368,44 @@ app.post('/api/checkout', async (req, res) => {
   }
 });
 
-// TODO avant prod : ajouter un endpoint webhook Stripe (/api/stripe-webhook) qui
-// écoute l'événement checkout.session.completed pour confirmer le paiement côté
-// serveur et déclencher la création réelle du dossier — ne jamais se fier
-// uniquement à la redirection success_url, qui peut être atteinte sans paiement réel.
+// TODO avant prod : une vraie base de données pour stocker durablement les
+// paiements confirmés (aujourd'hui juste journalisés + comptés en mémoire,
+// perdus au redémarrage) et déclencher la création réelle du dossier client.
+const confirmedPayments = { count: 0 };
+const STRIPE_WEBHOOK_SECRET = process.env.STRIPE_WEBHOOK_SECRET;
+
+// Webhook Stripe — la vraie source de vérité pour savoir si un paiement a
+// réellement eu lieu. La redirection success_url seule ne le prouve jamais :
+// n'importe qui peut atteindre cette URL sans avoir payé. Le corps doit rester
+// BRUT (express.raw, pas express.json) pour que la vérification de signature
+// fonctionne — Stripe signe les octets exacts envoyés.
+app.post('/api/stripe-webhook', express.raw({ type: 'application/json' }), (req, res) => {
+  if (!stripe || !STRIPE_WEBHOOK_SECRET) {
+    console.warn('Webhook Stripe reçu mais STRIPE_WEBHOOK_SECRET absente — signature non vérifiable, événement ignoré par sécurité.');
+    return res.status(503).send('Webhook non configuré');
+  }
+
+  let event;
+  try {
+    const signature = req.headers['stripe-signature'];
+    event = stripe.webhooks.constructEvent(req.body, signature, STRIPE_WEBHOOK_SECRET);
+  } catch (err) {
+    // Signature invalide : soit une fausse requête, soit une clé mal configurée.
+    // On rejette sans donner de détail exploitable dans la réponse.
+    console.warn('Signature du webhook Stripe invalide :', err.message);
+    return res.status(400).send('Signature invalide');
+  }
+
+  if (event.type === 'checkout.session.completed') {
+    const session = event.data.object;
+    confirmedPayments.count += 1;
+    console.log(`Paiement confirmé (webhook) : session ${session.id}, ${session.amount_total / 100}€, ref=${session.metadata?.ref || 'aucun'}`);
+    // TODO : c'est ICI qu'il faudra, une fois la base de données en place,
+    // enregistrer durablement le paiement et déclencher la création du dossier.
+  }
+
+  res.json({ received: true });
+});
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log(`monanonymat backend sur :${PORT}`));
