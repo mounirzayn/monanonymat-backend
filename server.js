@@ -42,10 +42,27 @@ async function initDb() {
       stripe_customer_id TEXT,
       stripe_subscription_id TEXT,
       active BOOLEAN NOT NULL DEFAULT true,
+      is_free_trial BOOLEAN NOT NULL DEFAULT false,
       last_score INTEGER,
       last_sensitive_count INTEGER,
       last_scanned_at TIMESTAMPTZ,
       created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+    );
+  `);
+  // Dossiers de suppression — le vrai contenu derrière "on lance les démarches",
+  // pas juste une promesse. Chaque contenu signalé au moment du paiement reçoit
+  // une vraie demande de suppression pré-rédigée, prête à envoyer.
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS dossiers (
+      id SERIAL PRIMARY KEY,
+      name TEXT NOT NULL,
+      email TEXT,
+      tier TEXT NOT NULL,
+      stripe_session_id TEXT,
+      status TEXT NOT NULL DEFAULT 'en_attente_paiement',
+      items JSONB,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+      paid_at TIMESTAMPTZ
     );
   `);
   console.log('Base de données prête (table veille_subscribers vérifiée).');
@@ -225,6 +242,106 @@ function guessSource(url = '') {
   try { return new URL(url).hostname.replace('www.', ''); } catch { return 'source inconnue'; }
 }
 
+// --- Génération des vraies demandes de suppression ---
+// Ce n'est pas un simple "on s'en occupe" : chaque contenu signalé au moment
+// du paiement reçoit un texte de demande prêt à l'emploi, adapté à sa nature.
+// Deux volets systématiques par contenu : la désindexation auprès du moteur
+// (formulaire officiel Google), et la mise en demeure adressée à l'hébergeur
+// du contenu lui-même (droit à l'effacement, art. 17 RGPD).
+// Grandes plateformes reconnues automatiquement — pour elles, ni email
+// générique ni formulaire RGPD classique : la vraie procédure qui fonctionne
+// est leur propre outil de signalement intégré, doublé de PHAROS (portail
+// officiel français, Arcom) en escalade. Sources vérifiées (Arcom, CNIL,
+// TAKE IT DOWN Act fédéral américain en vigueur depuis le 19 mai 2026).
+const KNOWN_PLATFORMS = [
+  {
+    match: /facebook\.com|instagram\.com/i,
+    name: 'Meta (Facebook/Instagram)',
+    guidance: `Utiliser le bouton "Signaler" directement sur la publication/le profil (menu ⋯) — c'est le canal le plus rapide, pas un email. Si le contenu est intime/sensible : citer le TAKE IT DOWN Act (loi fédérale US en vigueur depuis le 19 mai 2026), qui oblige la plateforme à retirer un contenu intime non consenti sous 48h.`,
+  },
+  {
+    match: /tiktok\.com/i,
+    name: 'TikTok',
+    guidance: `Signalement via le bouton "Signaler" sur la vidéo/le profil, ou support.tiktok.com/fr/safety-hc/report-a-problem/report-a-user. Contenu intime/sensible : le TAKE IT DOWN Act impose un retrait sous 48h depuis le 19 mai 2026.`,
+  },
+  {
+    match: /x\.com|twitter\.com/i,
+    name: 'X (ex-Twitter)',
+    guidance: `Menu ⋯ sur la publication → "Signaler" → catégorie "image intime" si applicable. Escalade sur help.x.com si pas de réponse. Contenu intime : TAKE IT DOWN Act, retrait sous 48h obligatoire.`,
+  },
+  {
+    match: /youtube\.com/i,
+    name: 'YouTube (Google)',
+    guidance: `Signalement intégré sous la vidéo (icône ⋮ → "Signaler"). Contenu intime : TAKE IT DOWN Act, retrait sous 48h.`,
+  },
+];
+
+function findKnownPlatform(url) {
+  return KNOWN_PLATFORMS.find((p) => p.match.test(url || ''));
+}
+
+function buildGoogleRemovalRequest(item, name) {
+  const motif = item.sensitive
+    ? "Ce contenu porte atteinte à ma vie privée et je souhaite en demander la suppression des résultats de recherche vous concernant, conformément au droit à l'oubli reconnu par la CNIL et la CJUE (arrêt Google Spain, 2014)."
+    : "Ce contenu, obsolète ou non pertinent, continue d'apparaître dans les résultats de recherche associés à mon nom et porte préjudice à ma réputation numérique.";
+  return [
+    `Formulaire à utiliser : support.google.com/websearch/troubleshooter/3111061 ("Supprimer des informations vous concernant sur Google")`,
+    `URL concernée : ${item.url || '(URL non disponible)'}`,
+    `Nom recherché associé : ${name}`,
+    ``,
+    `Texte suggéré pour le champ de description :`,
+    `"Bonjour, je souhaite demander le retrait de la page suivante des résultats de recherche associés à mon nom : ${item.url || '[URL]'}. ${motif}"`,
+  ].join('\n');
+}
+
+function buildHostNoticeRequest(item, name, hostContact = '[email de contact ou formulaire de contact du site]') {
+  const base = guessSource(item.url);
+  return [
+    `Destinataire : ${base} — ${hostContact}`,
+    `Objet : Demande de suppression de contenu — droit à l'effacement (art. 17 RGPD)`,
+    ``,
+    `Madame, Monsieur,`,
+    ``,
+    `Je vous contacte au sujet du contenu suivant, publié sur votre site et me concernant directement :`,
+    `${item.url || '(URL non disponible)'}`,
+    ``,
+    `Conformément à l'article 17 du Règlement Général sur la Protection des Données (RGPD), je vous demande la suppression de ce contenu dans un délai d'un mois à compter de la réception de la présente demande.`,
+    item.sensitive ? `Ce contenu revêt un caractère sensible et porte une atteinte directe à ma vie privée.` : `Ce contenu porte atteinte à ma réputation et n'a plus lieu d'être maintenu en ligne.`,
+    ``,
+    `À défaut de réponse ou de suppression dans le délai imparti, je me réserve le droit de saisir la CNIL.`,
+    ``,
+    `Cordialement,`,
+    `${name}`,
+  ].join('\n');
+}
+
+function buildDossierItems(results, name) {
+  return results.map((r) => {
+    const platform = findKnownPlatform(r.url);
+    return {
+      url: r.url || null,
+      type: r.type,
+      tag: r.tag,
+      sensitive: r.sensitive,
+      full: r.full,
+      status: 'à envoyer',
+      platform: platform?.name || null,
+      // Grande plateforme reconnue → stratégie vérifiée et spécifique.
+      // Sinon → générique (Google + mise en demeure RGPD à l'hébergeur).
+      // PHAROS ne traite que l'illicite (contenu intime non consenti,
+      // menaces, haine...) — proposé en escalade uniquement si le contenu
+      // est signalé comme sensible, jamais pour un contenu juste gênant.
+      strategy: platform
+        ? platform.guidance + (r.sensitive
+            ? `\n\nEscalade si sans réponse : PHAROS (portail officiel Arcom, contenu illicite) — internet-signalement.gouv.fr.`
+            : '')
+        : null,
+      googleRequest: buildGoogleRemovalRequest(r, name),
+      hostNotice: platform ? null : buildHostNoticeRequest(r, name),
+    };
+  });
+}
+
 function classify(items) {
   return items.map((item) => {
     const text = `${item.title} ${item.snippet}`.toLowerCase();
@@ -343,6 +460,7 @@ app.post('/api/scan', express.json({ limit: '10kb' }), async (req, res) => {
   // aux sources par scan (avant, une deuxième requête relançait tout une
   // fois), ce qui économise aussi le quota gratuit de Staan/Brave/SerpApi.
   const results = classified.map((r) => ({
+    url: r.url,
     type: guessType(r.url),
     tag: guessSource(r.url),
     year: '—',
@@ -364,16 +482,85 @@ const stripe = STRIPE_SECRET_KEY ? new Stripe(STRIPE_SECRET_KEY) : null;
 
 const OFFERS = {
   ponctuelle: { name: 'Suppression ponctuelle', amount: 14900, mode: 'payment' },
-  veille: { name: 'Veille & Protection (mensuel)', amount: 1900, mode: 'subscription' },
+  veille: { name: 'Veille & Protection (mensuel)', amount: 1900, mode: 'subscription', interval: 'month' },
+  veille_annuel: { name: 'Veille & Protection (annuel)', amount: 19000, mode: 'subscription', interval: 'year' },
   premium: { name: 'Accompagnement Premium', amount: 34900, mode: 'payment' },
 };
 
+// Préparation du dossier AVANT paiement — les demandes de suppression sont
+// déjà rédigées à ce stade, pour chaque contenu du scan. Rien n'est envoyé
+// tant que le paiement n'est pas confirmé par le webhook (voir plus bas).
+app.post('/api/prepare-dossier', express.json({ limit: '50kb' }), scanLimiter, async (req, res) => {
+  if (!pool) return res.status(503).json({ error: 'Base de données non configurée' });
+  const { name, tier, results } = req.body || {};
+  if (!name || !Array.isArray(results) || results.length === 0) {
+    return res.status(400).json({ error: 'Données de dossier invalides' });
+  }
+  try {
+    const items = buildDossierItems(results, name);
+    const { rows } = await pool.query(
+      `INSERT INTO dossiers (name, tier, items) VALUES ($1, $2, $3) RETURNING id`,
+      [name, tier, JSON.stringify(items)]
+    );
+    res.json({ dossier_id: rows[0].id });
+  } catch (err) {
+    console.warn('Échec de la préparation du dossier :', err.message);
+    res.status(500).json({ error: 'Impossible de préparer le dossier' });
+  }
+});
+
+// --- Consultation et gestion des dossiers — protégé par un secret d'admin,
+// jamais public. Volontairement simple (pas d'interface graphique) : une
+// requête avec le bon en-tête suffit à consulter ou clôturer un dossier.
+const ADMIN_SECRET = process.env.ADMIN_SECRET;
+const crypto = require('crypto');
+// Comparaison à temps constant — comparer deux chaînes avec !== fuit un
+// signal exploitable (le temps de réponse varie selon le nombre de
+// caractères corrects) qui peut aider à deviner le secret par tâtonnement.
+function safeCompare(a, b) {
+  if (typeof a !== 'string' || typeof b !== 'string' || a.length !== b.length) return false;
+  return crypto.timingSafeEqual(Buffer.from(a), Buffer.from(b));
+}
+function checkAdmin(req, res) {
+  if (!ADMIN_SECRET || !safeCompare(req.headers['x-admin-secret'] || '', ADMIN_SECRET)) {
+    res.status(403).json({ error: 'Non autorisé' });
+    return false;
+  }
+  return true;
+}
+// Même les routes protégées par secret doivent être limitées en débit —
+// sans ça, rien n'empêche un grand nombre de tentatives pour deviner le
+// secret par force brute.
+const adminLimiter = rateLimit({ windowMs: 60 * 1000, max: 20 });
+app.use('/api/admin', adminLimiter);
+app.use('/api/cron', adminLimiter);
+
+app.get('/api/admin/dossiers', async (req, res) => {
+  if (!checkAdmin(req, res)) return;
+  if (!pool) return res.status(503).json({ error: 'Base de données non configurée' });
+  const { status } = req.query;
+  const { rows } = status
+    ? await pool.query(`SELECT * FROM dossiers WHERE status = $1 ORDER BY created_at DESC`, [status])
+    : await pool.query(`SELECT * FROM dossiers ORDER BY created_at DESC LIMIT 50`);
+  res.json({ dossiers: rows });
+});
+
+app.post('/api/admin/dossiers/:id/status', express.json({ limit: '1kb' }), async (req, res) => {
+  if (!checkAdmin(req, res)) return;
+  if (!pool) return res.status(503).json({ error: 'Base de données non configurée' });
+  const { status } = req.body || {};
+  if (!status) return res.status(400).json({ error: 'status requis' });
+  await pool.query(`UPDATE dossiers SET status = $1 WHERE id = $2`, [status, req.params.id]);
+  res.json({ ok: true });
+});
+
 app.post('/api/checkout', express.json({ limit: '10kb' }), async (req, res) => {
   if (!stripe) return res.status(503).json({ error: 'Paiement non configuré (STRIPE_SECRET_KEY absente)' });
-  const { tier, ref, name } = req.body || {};
+  const { tier, ref, name, dossier_id } = req.body || {};
   const offer = OFFERS[tier];
   if (!offer) return res.status(400).json({ error: 'Offre inconnue' });
-  if (tier === 'veille' && (!name || name.trim().length < 2)) {
+  const isVeille = tier === 'veille' || tier === 'veille_annuel';
+  if (isVeille && (!name || name.trim().length < 2)) {
     return res.status(400).json({ error: 'Nom requis pour activer la veille' });
   }
 
@@ -383,7 +570,7 @@ app.post('/api/checkout', express.json({ limit: '10kb' }), async (req, res) => {
       product_data: { name: offer.name },
       unit_amount: offer.amount,
     };
-    if (offer.mode === 'subscription') priceData.recurring = { interval: 'month' };
+    if (offer.mode === 'subscription') priceData.recurring = { interval: offer.interval };
 
     const session = await stripe.checkout.sessions.create({
       mode: offer.mode,
@@ -394,9 +581,15 @@ app.post('/api/checkout', express.json({ limit: '10kb' }), async (req, res) => {
       // devient une vraie liste de clients consultable, sans base de données
       // maison à construire pour l'instant.
       customer_creation: offer.mode === 'payment' ? 'always' : undefined,
-      // Code de parrainage/apporteur d'affaires, et nom recherché pour la
-      // Veille — rattachés ici, au vrai moment où l'abonnement se confirme.
-      metadata: { ...(ref ? { ref } : {}), ...(tier === 'veille' ? { veille_name: name.trim() } : {}) },
+      // Code de parrainage, nom recherché pour la Veille, et dossier de
+      // suppression préparé en amont — rattachés au vrai moment où le
+      // paiement se confirme.
+      metadata: {
+        ...(ref ? { ref } : {}),
+        ...(isVeille ? { veille_name: name.trim() } : {}),
+        ...(dossier_id ? { dossier_id: String(dossier_id) } : {}),
+        tier,
+      },
       success_url: `${FRONTEND_URL}?paiement=succes&session_id={CHECKOUT_SESSION_ID}`,
       cancel_url: `${FRONTEND_URL}?paiement=annule`,
     });
@@ -433,9 +626,126 @@ app.post('/api/portal', express.json({ limit: '10kb' }), async (req, res) => {
   }
 });
 
-// TODO avant prod : une vraie base de données pour stocker durablement les
-// paiements confirmés (aujourd'hui juste journalisés + comptés en mémoire,
-// perdus au redémarrage) et déclencher la création réelle du dossier client.
+// --- Envoi d'email via Brevo — réactivé spécifiquement pour les alertes Veille.
+// ⚠️ Ne fonctionnera réellement qu'une fois le domaine monanonymat.fr authentifié
+// (SPF/DKIM/DMARC) sur Brevo — un envoi depuis une adresse Gmail est rejeté par
+// Brevo (voir l'historique du projet). Tant que ce n'est pas fait, cette
+// fonction échouera proprement (loggée, sans planter le reste du processus).
+const BREVO_API_KEY = process.env.BREVO_API_KEY;
+const BREVO_SENDER_EMAIL = process.env.BREVO_SENDER_EMAIL;
+const BREVO_SENDER_NAME = process.env.BREVO_SENDER_NAME || 'monanonymat.fr';
+
+async function sendVeilleAlert({ to, name, newScore, newSensitiveCount }) {
+  if (!BREVO_API_KEY || !BREVO_SENDER_EMAIL) {
+    console.warn(`Alerte Veille pour "${name}" NON envoyée — Brevo non configuré.`);
+    return { sent: false };
+  }
+  try {
+    const res = await fetch('https://api.brevo.com/v3/smtp/email', {
+      method: 'POST',
+      headers: { 'api-key': BREVO_API_KEY, 'Content-Type': 'application/json', Accept: 'application/json' },
+      body: JSON.stringify({
+        sender: { name: BREVO_SENDER_NAME, email: BREVO_SENDER_EMAIL },
+        to: [{ email: to }],
+        subject: `Nouveau contenu détecté — ${name}`,
+        htmlContent: `<p>Votre veille a détecté un changement : score actuel <b>${newScore}/100</b>, dont ${newSensitiveCount} contenu(s) sensible(s). Connectez-vous à monanonymat.fr pour voir le détail et agir.</p>`,
+      }),
+    });
+    return { sent: res.ok };
+  } catch (err) {
+    console.warn('Brevo (alerte Veille) indisponible :', err.message);
+    return { sent: false };
+  }
+}
+
+// --- Tâche planifiée : re-scan automatique des abonnés Veille ---
+// Protégée par un secret partagé — cette route n'est jamais appelée par un
+// visiteur, uniquement par le planificateur externe (Render Cron Jobs ou
+// équivalent). Sans le bon secret en en-tête, la requête est rejetée.
+const CRON_SECRET = process.env.CRON_SECRET;
+
+app.post('/api/cron/rescan-veille', async (req, res) => {
+  if (!CRON_SECRET || !safeCompare(req.headers['x-cron-secret'] || '', CRON_SECRET)) {
+    return res.status(403).json({ error: 'Non autorisé' });
+  }
+  if (!pool) return res.status(503).json({ error: 'Base de données non configurée' });
+
+  // Les mois de Veille offerts (suite à une suppression ponctuelle) expirent
+  // après 30 jours — au client de s'abonner pour de vrai s'il veut continuer.
+  const { rowCount: expired } = await pool.query(
+    `UPDATE veille_subscribers SET active = false
+     WHERE is_free_trial = true AND active = true AND created_at < now() - interval '30 days'`
+  );
+  if (expired > 0) console.log(`${expired} essai(s) gratuit(s) de Veille expiré(s).`);
+
+  const { rows: subscribers } = await pool.query(
+    `SELECT id, name, email, last_score, last_sensitive_count FROM veille_subscribers WHERE active = true`
+  );
+
+  let alertsSent = 0;
+  for (const sub of subscribers) {
+    try {
+      const { classified, score, hardStop } = await performScan(sub.name);
+      if (hardStop) continue; // jamais de traitement automatique sur un signal mineur — voir hasHardStopSignal()
+      const sensitiveCount = classified.filter((r) => r.sensitive).length;
+
+      const isNewOrWorse = sub.last_score === null ||
+        score > sub.last_score ||
+        sensitiveCount > (sub.last_sensitive_count || 0);
+
+      if (isNewOrWorse && sub.last_score !== null && sub.email) {
+        const alert = await sendVeilleAlert({ to: sub.email, name: sub.name, newScore: score, newSensitiveCount: sensitiveCount });
+        if (alert.sent) alertsSent += 1;
+      }
+
+      await pool.query(
+        `UPDATE veille_subscribers SET last_score = $1, last_sensitive_count = $2, last_scanned_at = now() WHERE id = $3`,
+        [score, sensitiveCount, sub.id]
+      );
+    } catch (err) {
+      console.warn(`Échec du re-scan Veille pour l'abonné ${sub.id} :`, err.message);
+    }
+  }
+
+  console.log(`Re-scan Veille terminé : ${subscribers.length} abonné(s) traité(s), ${alertsSent} alerte(s) envoyée(s).`);
+
+  // Relance automatique des dossiers de suppression en retard — le RGPD
+  // laisse un délai d'un mois pour répondre à une mise en demeure. Passé ce
+  // délai sans qu'un dossier soit marqué "résolu", on prévient l'exploitant
+  // du site (toi) plutôt que de compter sur une vérification manuelle.
+  let dossierReminderSent = false;
+  try {
+    const { rows: overdueDossiers } = await pool.query(
+      `SELECT id, name, tier, created_at FROM dossiers
+       WHERE status = 'à traiter' AND paid_at < now() - interval '30 days'`
+    );
+    if (overdueDossiers.length > 0 && BREVO_API_KEY && BREVO_SENDER_EMAIL) {
+      const list = overdueDossiers.map((d) => `#${d.id} — ${d.name} (${d.tier})`).join('<br>');
+      const alertRes = await fetch('https://api.brevo.com/v3/smtp/email', {
+        method: 'POST',
+        headers: { 'api-key': BREVO_API_KEY, 'Content-Type': 'application/json', Accept: 'application/json' },
+        body: JSON.stringify({
+          sender: { name: BREVO_SENDER_NAME, email: BREVO_SENDER_EMAIL },
+          to: [{ email: BREVO_SENDER_EMAIL }],
+          subject: `${overdueDossiers.length} dossier(s) de suppression en retard (>30 jours)`,
+          htmlContent: `<p>Ces dossiers n'ont pas été marqués comme résolus plus d'un mois après le paiement :</p><p>${list}</p>`,
+        }),
+      });
+      dossierReminderSent = alertRes.ok;
+      if (dossierReminderSent) console.log(`Relance envoyée pour ${overdueDossiers.length} dossier(s) en retard.`);
+    }
+  } catch (err) {
+    console.warn('Échec de la vérification des dossiers en retard :', err.message);
+  }
+
+  res.json({ processed: subscribers.length, alertsSent, dossierReminderSent });
+});
+
+// Les abonnements Veille sont maintenant stockés durablement (table
+// veille_subscribers ci-dessus). Les paiements ponctuels (suppression,
+// premium) restent seulement journalisés/comptés en mémoire pour l'instant —
+// suffisant tant qu'ils sont traités manuellement, mais à stocker aussi en
+// base le jour où leur suivi doit être consultable après un redémarrage.
 const confirmedPayments = { count: 0 };
 const STRIPE_WEBHOOK_SECRET = process.env.STRIPE_WEBHOOK_SECRET;
 
@@ -444,7 +754,128 @@ const STRIPE_WEBHOOK_SECRET = process.env.STRIPE_WEBHOOK_SECRET;
 // n'importe qui peut atteindre cette URL sans avoir payé. Le corps doit rester
 // BRUT (express.raw, pas express.json) pour que la vérification de signature
 // fonctionne — Stripe signe les octets exacts envoyés.
-app.post('/api/stripe-webhook', express.raw({ type: 'application/json' }), (req, res) => {
+// --- Module "auto-nettoyage X" ---
+// Contrairement à la suppression de contenu tiers, ceci EST automatisable :
+// c'est le compte de la personne elle-même, elle peut légitimement autoriser
+// une application à agir en son nom. X propose une vraie API pour ça depuis
+// février 2026 (tarif à l'usage, ~0,015€ par suppression — pas d'abonnement
+// fixe nécessaire). OAuth 2.0 + PKCE, comme recommandé par X.
+const X_CLIENT_ID = process.env.X_CLIENT_ID;
+const X_CLIENT_SECRET = process.env.X_CLIENT_SECRET;
+const X_REDIRECT_URI = process.env.X_REDIRECT_URI || `${FRONTEND_URL}/nettoyage-x.html`;
+
+// État de connexion temporaire — un token d'accès X vaut de l'argent réel et
+// donne un accès complet au compte de la personne : on ne le garde jamais
+// plus longtemps que la session de nettoyage en cours, jamais en base.
+const xSessions = new Map(); // state -> { verifier, accessToken?, expiresAt }
+function cleanupExpiredXSessions() {
+  const now = Date.now();
+  for (const [state, s] of xSessions) if (s.expiresAt < now) xSessions.delete(state);
+}
+
+function base64url(buffer) {
+  return buffer.toString('base64').replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+}
+
+app.get('/api/x/auth-url', (req, res) => {
+  if (!X_CLIENT_ID) return res.status(503).json({ error: "Nettoyage X non configuré (X_CLIENT_ID absente)" });
+  cleanupExpiredXSessions();
+  const state = crypto.randomBytes(16).toString('hex');
+  const verifier = base64url(crypto.randomBytes(32));
+  const challenge = base64url(crypto.createHash('sha256').update(verifier).digest());
+  xSessions.set(state, { verifier, expiresAt: Date.now() + 10 * 60 * 1000 }); // 10 min pour compléter la connexion
+
+  const params = new URLSearchParams({
+    response_type: 'code',
+    client_id: X_CLIENT_ID,
+    redirect_uri: X_REDIRECT_URI,
+    scope: 'tweet.read tweet.write users.read offline.access',
+    state,
+    code_challenge: challenge,
+    code_challenge_method: 'S256',
+  });
+  res.json({ url: `https://x.com/i/oauth2/authorize?${params.toString()}`, state });
+});
+
+app.post('/api/x/callback', express.json({ limit: '2kb' }), scanLimiter, async (req, res) => {
+  if (!X_CLIENT_ID || !X_CLIENT_SECRET) return res.status(503).json({ error: 'Nettoyage X non configuré' });
+  const { code, state } = req.body || {};
+  const session = xSessions.get(state);
+  if (!code || !session) return res.status(400).json({ error: 'Session de connexion invalide ou expirée — recommencez.' });
+
+  try {
+    const tokenRes = await fetch('https://api.x.com/2/oauth2/token', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/x-www-form-urlencoded',
+        Authorization: `Basic ${Buffer.from(`${X_CLIENT_ID}:${X_CLIENT_SECRET}`).toString('base64')}`,
+      },
+      body: new URLSearchParams({
+        grant_type: 'authorization_code', code, redirect_uri: X_REDIRECT_URI, code_verifier: session.verifier,
+      }),
+    });
+    if (!tokenRes.ok) {
+      const body = await tokenRes.text().catch(() => '');
+      console.warn(`X OAuth token a répondu ${tokenRes.status} : ${body.slice(0, 300)}`);
+      return res.status(502).json({ error: 'Connexion à X refusée' });
+    }
+    const tokenData = await tokenRes.json();
+    // Le token remplace le verifier — la session ne sert plus qu'à cette
+    // seule fenêtre de nettoyage, jamais persistée au-delà d'une heure.
+    xSessions.set(state, { accessToken: tokenData.access_token, expiresAt: Date.now() + 60 * 60 * 1000 });
+    res.json({ ok: true, state });
+  } catch (err) {
+    console.warn('X OAuth callback indisponible :', err.message);
+    res.status(500).json({ error: 'Connexion à X indisponible' });
+  }
+});
+
+app.get('/api/x/tweets', scanLimiter, async (req, res) => {
+  const session = xSessions.get(req.query.state);
+  if (!session?.accessToken) return res.status(401).json({ error: 'Non connecté à X' });
+  try {
+    const meRes = await fetch('https://api.x.com/2/users/me', {
+      headers: { Authorization: `Bearer ${session.accessToken}` },
+    });
+    if (!meRes.ok) return res.status(502).json({ error: 'Impossible de récupérer le profil X' });
+    const me = await meRes.json();
+    const tweetsRes = await fetch(
+      `https://api.x.com/2/users/${me.data.id}/tweets?max_results=100&tweet.fields=created_at`,
+      { headers: { Authorization: `Bearer ${session.accessToken}` } }
+    );
+    if (!tweetsRes.ok) return res.status(502).json({ error: 'Impossible de récupérer les tweets' });
+    const tweets = await tweetsRes.json();
+    res.json({ username: me.data.username, tweets: tweets.data || [] });
+  } catch (err) {
+    console.warn('X tweets indisponible :', err.message);
+    res.status(500).json({ error: 'X indisponible' });
+  }
+});
+
+app.post('/api/x/delete-batch', express.json({ limit: '10kb' }), scanLimiter, async (req, res) => {
+  const { state, tweetIds } = req.body || {};
+  const session = xSessions.get(state);
+  if (!session?.accessToken) return res.status(401).json({ error: 'Non connecté à X' });
+  if (!Array.isArray(tweetIds) || tweetIds.length === 0 || tweetIds.length > 200) {
+    return res.status(400).json({ error: 'Liste de tweets invalide (1 à 200 par lot)' });
+  }
+  const results = { deleted: 0, failed: 0 };
+  // Séquentiel, volontairement : la limite de débit de X est stricte, et
+  // chaque suppression a un coût réel — pas question de la parallèliser.
+  for (const id of tweetIds) {
+    try {
+      const delRes = await fetch(`https://api.x.com/2/tweets/${id}`, {
+        method: 'DELETE',
+        headers: { Authorization: `Bearer ${session.accessToken}` },
+      });
+      if (delRes.ok) results.deleted += 1; else results.failed += 1;
+    } catch { results.failed += 1; }
+  }
+  console.log(`Nettoyage X : ${results.deleted} tweet(s) supprimé(s), ${results.failed} échec(s).`);
+  res.json(results);
+});
+
+app.post('/api/stripe-webhook', express.raw({ type: 'application/json' }), async (req, res) => {
   if (!stripe || !STRIPE_WEBHOOK_SECRET) {
     console.warn('Webhook Stripe reçu mais STRIPE_WEBHOOK_SECRET absente — signature non vérifiable, événement ignoré par sécurité.');
     return res.status(503).send('Webhook non configuré');
@@ -481,6 +912,55 @@ app.post('/api/stripe-webhook', express.raw({ type: 'application/json' }), (req,
     } else if (veilleName && !pool) {
       console.warn(`Veille payée pour "${veilleName}" mais AUCUNE base de données configurée — abonnement perdu, non surveillé. Configurer DATABASE_URL en urgence.`);
     }
+
+    // Activation du dossier de suppression préparé avant paiement — les
+    // demandes rédigées à l'avance deviennent officiellement à traiter.
+    // Vérification de cohérence : le dossier doit correspondre au tarif
+    // réellement payé et ne pas avoir déjà été activé — sans ça, un
+    // dossier_id existant pourrait être détourné sur un autre paiement.
+    const dossierId = session.metadata?.dossier_id;
+    if (dossierId && pool) {
+      try {
+        const { rows: existing } = await pool.query(`SELECT tier, status FROM dossiers WHERE id = $1`, [dossierId]);
+        const dossier = existing[0];
+        if (!dossier) {
+          console.warn(`Dossier #${dossierId} introuvable — paiement confirmé mais rien à activer.`);
+        } else if (dossier.status !== 'en_attente_paiement') {
+          console.warn(`Dossier #${dossierId} déjà activé ou traité (statut "${dossier.status}") — activation ignorée.`);
+        } else if (dossier.tier !== session.metadata?.tier) {
+          console.warn(`Dossier #${dossierId} : tarif du dossier ("${dossier.tier}") différent du tarif payé ("${session.metadata?.tier}") — activation refusée par sécurité.`);
+        } else {
+          await pool.query(
+            `UPDATE dossiers SET status = 'à traiter', email = $1, stripe_session_id = $2, paid_at = now() WHERE id = $3`,
+            [session.customer_details?.email || null, session.id, dossierId]
+          );
+          console.log(`Dossier #${dossierId} activé après paiement confirmé.`);
+        }
+      } catch (err) {
+        console.warn('Échec de l\'activation du dossier :', err.message);
+      }
+    }
+
+    // Suppression ponctuelle → 1 mois de Veille offert automatiquement, pour
+    // qu'un client ne se sente jamais "réglé" à tort pendant que le contenu
+    // supprimé peut réapparaître ailleurs.
+    if (session.metadata?.tier === 'ponctuelle' && pool) {
+      try {
+        const { rows } = dossierId
+          ? await pool.query(`SELECT name FROM dossiers WHERE id = $1`, [dossierId])
+          : { rows: [] };
+        const nameForTrial = rows[0]?.name;
+        if (nameForTrial) {
+          await pool.query(
+            `INSERT INTO veille_subscribers (name, email, active, is_free_trial) VALUES ($1, $2, true, true)`,
+            [nameForTrial, session.customer_details?.email || null]
+          );
+          console.log(`Mois de Veille offert activé pour "${nameForTrial}" (suite à une suppression ponctuelle).`);
+        }
+      } catch (err) {
+        console.warn('Échec de l\'activation de l\'essai Veille offert :', err.message);
+      }
+    }
   }
 
   if (event.type === 'customer.subscription.deleted' && pool) {
@@ -501,4 +981,5 @@ app.post('/api/stripe-webhook', express.raw({ type: 'application/json' }), (req,
 });
 
 const PORT = process.env.PORT || 3000;
+initDb().catch((err) => console.warn('Échec de l\'initialisation de la base de données :', err.message));
 app.listen(PORT, () => console.log(`monanonymat backend sur :${PORT}`));
