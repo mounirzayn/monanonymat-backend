@@ -19,7 +19,37 @@ const express = require('express');
 const rateLimit = require('express-rate-limit');
 const cors = require('cors');
 const helmet = require('helmet');
+const { Pool } = require('pg');
 require('dotenv').config();
+
+// --- Base de données (PostgreSQL) ---
+// Nécessaire pour que la Veille soit un vrai service automatisé : sans
+// mémoire durable, impossible de savoir qui est abonné et quel était son
+// dernier résultat pour détecter un changement. Render propose une base
+// PostgreSQL gratuite sur la même plateforme que ce serveur — DATABASE_URL
+// est fournie automatiquement si la base est reliée au même projet Render,
+// sinon à copier manuellement depuis le tableau de bord de la base.
+const DATABASE_URL = process.env.DATABASE_URL;
+const pool = DATABASE_URL ? new Pool({ connectionString: DATABASE_URL, ssl: { rejectUnauthorized: false } }) : null;
+
+async function initDb() {
+  if (!pool) { console.warn('DATABASE_URL absente — la Veille automatisée ne peut pas fonctionner sans base de données.'); return; }
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS veille_subscribers (
+      id SERIAL PRIMARY KEY,
+      name TEXT NOT NULL,
+      email TEXT NOT NULL,
+      stripe_customer_id TEXT,
+      stripe_subscription_id TEXT,
+      active BOOLEAN NOT NULL DEFAULT true,
+      last_score INTEGER,
+      last_sensitive_count INTEGER,
+      last_scanned_at TIMESTAMPTZ,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+    );
+  `);
+  console.log('Base de données prête (table veille_subscribers vérifiée).');
+}
 
 const app = express();
 // Render est derrière un proxy inverse — sans ce réglage, express-rate-limit
@@ -62,6 +92,7 @@ app.use('/api/scan', scanLimiter);
 // ça peut faire réagir la protection anti-fraude de Stripe pour rien).
 const checkoutLimiter = rateLimit({ windowMs: 60 * 1000, max: 10 });
 app.use('/api/checkout', checkoutLimiter);
+app.use('/api/portal', checkoutLimiter);
 
 // --- Compteur réel, pas un chiffre inventé pour la preuve sociale ---
 // ⚠️ En mémoire : remis à zéro à chaque redémarrage du serveur. Sur le plan
@@ -339,9 +370,12 @@ const OFFERS = {
 
 app.post('/api/checkout', express.json({ limit: '10kb' }), async (req, res) => {
   if (!stripe) return res.status(503).json({ error: 'Paiement non configuré (STRIPE_SECRET_KEY absente)' });
-  const { tier, ref } = req.body || {};
+  const { tier, ref, name } = req.body || {};
   const offer = OFFERS[tier];
   if (!offer) return res.status(400).json({ error: 'Offre inconnue' });
+  if (tier === 'veille' && (!name || name.trim().length < 2)) {
+    return res.status(400).json({ error: 'Nom requis pour activer la veille' });
+  }
 
   try {
     const priceData = {
@@ -355,16 +389,47 @@ app.post('/api/checkout', express.json({ limit: '10kb' }), async (req, res) => {
       mode: offer.mode,
       payment_method_types: ['card'],
       line_items: [{ price_data: priceData, quantity: 1 }],
-      // Code de parrainage/apporteur d'affaires rattaché ici, au vrai moment où
-      // une commission se déclenche (achat effectif) — voir affiliation/README.md.
-      metadata: ref ? { ref } : undefined,
-      success_url: `${FRONTEND_URL}?paiement=succes`,
+      // Un vrai client Stripe est créé à chaque paiement, même ponctuel — sans
+      // ça, Stripe ne garde qu'une trace anonyme. Avec ça, le dashboard Stripe
+      // devient une vraie liste de clients consultable, sans base de données
+      // maison à construire pour l'instant.
+      customer_creation: offer.mode === 'payment' ? 'always' : undefined,
+      // Code de parrainage/apporteur d'affaires, et nom recherché pour la
+      // Veille — rattachés ici, au vrai moment où l'abonnement se confirme.
+      metadata: { ...(ref ? { ref } : {}), ...(tier === 'veille' ? { veille_name: name.trim() } : {}) },
+      success_url: `${FRONTEND_URL}?paiement=succes&session_id={CHECKOUT_SESSION_ID}`,
       cancel_url: `${FRONTEND_URL}?paiement=annule`,
     });
     res.json({ url: session.url });
   } catch (err) {
     console.warn('Stripe indisponible :', err.message);
     res.status(500).json({ error: 'Impossible de créer la session de paiement' });
+  }
+});
+
+// Portail client Stripe — permet à quelqu'un d'abonné à la Veille de gérer ou
+// résilier lui-même son abonnement (moyen de paiement, factures, annulation),
+// sans compte sur notre site et sans qu'il ait besoin de nous écrire un email.
+// On retrouve le client à partir du session_id que Stripe renvoie dans
+// l'URL de succès ({CHECKOUT_SESSION_ID}) — aucune donnée stockée de notre côté.
+app.post('/api/portal', express.json({ limit: '10kb' }), async (req, res) => {
+  if (!stripe) return res.status(503).json({ error: 'Non configuré' });
+  const { session_id } = req.body || {};
+  if (!session_id) return res.status(400).json({ error: 'session_id manquant' });
+
+  try {
+    const checkoutSession = await stripe.checkout.sessions.retrieve(session_id);
+    if (!checkoutSession.customer) {
+      return res.status(404).json({ error: "Aucun abonnement associé à cette session" });
+    }
+    const portalSession = await stripe.billingPortal.sessions.create({
+      customer: checkoutSession.customer,
+      return_url: FRONTEND_URL,
+    });
+    res.json({ url: portalSession.url });
+  } catch (err) {
+    console.warn('Portail Stripe indisponible :', err.message);
+    res.status(500).json({ error: "Impossible d'ouvrir le portail de gestion" });
   }
 });
 
@@ -400,8 +465,36 @@ app.post('/api/stripe-webhook', express.raw({ type: 'application/json' }), (req,
     const session = event.data.object;
     confirmedPayments.count += 1;
     console.log(`Paiement confirmé (webhook) : session ${session.id}, ${session.amount_total / 100}€, ref=${session.metadata?.ref || 'aucun'}`);
-    // TODO : c'est ICI qu'il faudra, une fois la base de données en place,
-    // enregistrer durablement le paiement et déclencher la création du dossier.
+
+    const veilleName = session.metadata?.veille_name;
+    if (veilleName && pool) {
+      try {
+        await pool.query(
+          `INSERT INTO veille_subscribers (name, email, stripe_customer_id, stripe_subscription_id)
+           VALUES ($1, $2, $3, $4)`,
+          [veilleName, session.customer_details?.email || null, session.customer || null, session.subscription || null]
+        );
+        console.log(`Veille activée pour "${veilleName}" — abonné enregistré en base.`);
+      } catch (err) {
+        console.warn('Échec de l\'enregistrement de l\'abonné Veille en base :', err.message);
+      }
+    } else if (veilleName && !pool) {
+      console.warn(`Veille payée pour "${veilleName}" mais AUCUNE base de données configurée — abonnement perdu, non surveillé. Configurer DATABASE_URL en urgence.`);
+    }
+  }
+
+  if (event.type === 'customer.subscription.deleted' && pool) {
+    // Résiliation (portail client ou impayé) — on arrête la surveillance associée.
+    const subscription = event.data.object;
+    try {
+      await pool.query(
+        `UPDATE veille_subscribers SET active = false WHERE stripe_subscription_id = $1`,
+        [subscription.id]
+      );
+      console.log(`Abonnement Veille résilié (${subscription.id}) — surveillance désactivée.`);
+    } catch (err) {
+      console.warn('Échec de la désactivation de l\'abonné :', err.message);
+    }
   }
 
   res.json({ received: true });
