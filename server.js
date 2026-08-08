@@ -551,6 +551,31 @@ app.post('/api/admin/dossiers/:id/status', express.json({ limit: '1kb' }), async
   const { status } = req.body || {};
   if (!status) return res.status(400).json({ error: 'status requis' });
   await pool.query(`UPDATE dossiers SET status = $1 WHERE id = $2`, [status, req.params.id]);
+
+  // Confirmation au client quand un dossier passe à "résolu" — tient la
+  // promesse faite dans l'email d'alerte Veille ("vous recevrez une
+  // confirmation une fois traité").
+  if (status === 'résolu' && BREVO_API_KEY && BREVO_SENDER_EMAIL) {
+    try {
+      const { rows } = await pool.query(`SELECT name, email FROM dossiers WHERE id = $1`, [req.params.id]);
+      const dossier = rows[0];
+      if (dossier?.email) {
+        await fetch('https://api.brevo.com/v3/smtp/email', {
+          method: 'POST',
+          headers: { 'api-key': BREVO_API_KEY, 'Content-Type': 'application/json', Accept: 'application/json' },
+          body: JSON.stringify({
+            sender: { name: BREVO_SENDER_NAME, email: BREVO_SENDER_EMAIL },
+            to: [{ email: dossier.email }],
+            subject: `Dossier traité — ${dossier.name}`,
+            htmlContent: `<p>Le contenu signalé a été pris en charge et le dossier est maintenant résolu. Merci de votre confiance.</p>`,
+          }),
+        });
+      }
+    } catch (err) {
+      console.warn('Échec de la confirmation client au client :', err.message);
+    }
+  }
+
   res.json({ ok: true });
 });
 
@@ -648,7 +673,7 @@ async function sendVeilleAlert({ to, name, newScore, newSensitiveCount }) {
         sender: { name: BREVO_SENDER_NAME, email: BREVO_SENDER_EMAIL },
         to: [{ email: to }],
         subject: `Nouveau contenu détecté — ${name}`,
-        htmlContent: `<p>Votre veille a détecté un changement : score actuel <b>${newScore}/100</b>, dont ${newSensitiveCount} contenu(s) sensible(s). Connectez-vous à monanonymat.fr pour voir le détail et agir.</p>`,
+        htmlContent: `<p>Votre veille a détecté un changement : score actuel <b>${newScore}/100</b>, dont ${newSensitiveCount} contenu(s) sensible(s). La prise en charge démarre automatiquement de notre côté — vous recevrez une confirmation une fois traité.</p>`,
       }),
     });
     return { sent: res.ok };
@@ -696,6 +721,24 @@ app.post('/api/cron/rescan-veille', async (req, res) => {
       if (isNewOrWorse && sub.last_score !== null && sub.email) {
         const alert = await sendVeilleAlert({ to: sub.email, name: sub.name, newScore: score, newSensitiveCount: sensitiveCount });
         if (alert.sent) alertsSent += 1;
+
+        // La Veille promet une suppression automatique, pas juste une
+        // alerte — sans ce dossier généré tout seul, la promesse marketing
+        // ne correspondrait pas à ce que fait vraiment le système.
+        try {
+          const newResults = classified.map((r) => ({
+            url: r.url, type: guessType(r.url), tag: guessSource(r.url), year: '—',
+            sensitive: r.sensitive, confidence: r.confidence,
+            full: r.snippet || r.title || 'Contenu trouvé, description non disponible.',
+          }));
+          const items = buildDossierItems(newResults, sub.name);
+          await pool.query(
+            `INSERT INTO dossiers (name, email, tier, status, items, paid_at) VALUES ($1, $2, 'veille_auto', 'à traiter', $3, now())`,
+            [sub.name, sub.email, JSON.stringify(items)]
+          );
+        } catch (err) {
+          console.warn(`Échec de la génération auto du dossier Veille pour l'abonné ${sub.id} :`, err.message);
+        }
       }
 
       await pool.query(
@@ -777,7 +820,7 @@ function base64url(buffer) {
   return buffer.toString('base64').replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
 }
 
-app.get('/api/x/auth-url', (req, res) => {
+app.get('/api/x/auth-url', scanLimiter, (req, res) => {
   if (!X_CLIENT_ID) return res.status(503).json({ error: "Nettoyage X non configuré (X_CLIENT_ID absente)" });
   cleanupExpiredXSessions();
   const state = crypto.randomBytes(16).toString('hex');
