@@ -485,6 +485,19 @@ const OFFERS = {
   veille: { name: 'Veille & Protection (mensuel)', amount: 1900, mode: 'subscription', interval: 'month' },
   veille_annuel: { name: 'Veille & Protection (annuel)', amount: 19000, mode: 'subscription', interval: 'year' },
   premium: { name: 'Accompagnement Premium', amount: 34900, mode: 'payment' },
+  ebook_disparaitre: { name: 'Ebook — Disparaître d\'internet', amount: 900, mode: 'payment' },
+  ebook_savent: { name: 'Ebook — Ce qu\'ils savent de vous', amount: 900, mode: 'payment' },
+  ebook_rupture: { name: 'Ebook — Rupture et vie privée numérique', amount: 900, mode: 'payment' },
+  ebook_pack: { name: 'Pack des 3 ebooks', amount: 1900, mode: 'payment' },
+};
+
+// Fichiers réellement livrés pour chaque offre ebook — utilisé après paiement
+// confirmé pour savoir quoi proposer en téléchargement.
+const EBOOK_FILES = {
+  ebook_disparaitre: ['1-disparaitre-internet.pdf'],
+  ebook_savent: ['2-ce-quils-savent-de-vous.pdf'],
+  ebook_rupture: ['3-rupture-vie-privee-numerique.pdf'],
+  ebook_pack: ['1-disparaitre-internet.pdf', '2-ce-quils-savent-de-vous.pdf', '3-rupture-vie-privee-numerique.pdf'],
 };
 
 // Préparation du dossier AVANT paiement — les demandes de suppression sont
@@ -493,8 +506,11 @@ const OFFERS = {
 app.post('/api/prepare-dossier', express.json({ limit: '50kb' }), scanLimiter, async (req, res) => {
   if (!pool) return res.status(503).json({ error: 'Base de données non configurée' });
   const { name, tier, results } = req.body || {};
-  if (!name || !Array.isArray(results) || results.length === 0) {
+  if (!name || !Array.isArray(results) || results.length === 0 || results.length > 100) {
     return res.status(400).json({ error: 'Données de dossier invalides' });
+  }
+  if (!['ponctuelle', 'premium'].includes(tier)) {
+    return res.status(400).json({ error: 'Offre invalide pour un dossier' });
   }
   try {
     const items = buildDossierItems(results, name);
@@ -549,7 +565,13 @@ app.post('/api/admin/dossiers/:id/status', express.json({ limit: '1kb' }), async
   if (!checkAdmin(req, res)) return;
   if (!pool) return res.status(503).json({ error: 'Base de données non configurée' });
   const { status } = req.body || {};
-  if (!status) return res.status(400).json({ error: 'status requis' });
+  const VALID_STATUSES = ['en_attente_paiement', 'à traiter', 'résolu', 'annulé'];
+  if (!status || !VALID_STATUSES.includes(status)) {
+    return res.status(400).json({ error: `status invalide — valeurs acceptées : ${VALID_STATUSES.join(', ')}` });
+  }
+  if (!/^\d+$/.test(req.params.id)) {
+    return res.status(400).json({ error: 'Identifiant de dossier invalide' });
+  }
   await pool.query(`UPDATE dossiers SET status = $1 WHERE id = $2`, [status, req.params.id]);
 
   // Confirmation au client quand un dossier passe à "résolu" — tient la
@@ -615,7 +637,7 @@ app.post('/api/checkout', express.json({ limit: '10kb' }), async (req, res) => {
         ...(dossier_id ? { dossier_id: String(dossier_id) } : {}),
         tier,
       },
-      success_url: `${FRONTEND_URL}?paiement=succes&session_id={CHECKOUT_SESSION_ID}`,
+      success_url: `${FRONTEND_URL}?paiement=succes&session_id={CHECKOUT_SESSION_ID}&tier=${tier}`,
       cancel_url: `${FRONTEND_URL}?paiement=annule`,
     });
     res.json({ url: session.url });
