@@ -124,7 +124,8 @@ app.use('/api/portal', checkoutLimiter);
 // que ce chiffre doit rester fiable sur la durée.
 const stats = { scanCount: 0, scoreSum: 0, since: new Date().toISOString() };
 
-app.get('/api/stats', (req, res) => {
+const statsLimiter = rateLimit({ windowMs: 60 * 1000, max: 30 });
+app.get('/api/stats', statsLimiter, (req, res) => {
   res.json({
     scanCount: stats.scanCount,
     averageScore: stats.scanCount > 0 ? Math.round(stats.scoreSum / stats.scanCount) : null,
