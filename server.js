@@ -70,6 +70,20 @@ async function initDb() {
   // que le nombre de lignes grandira, alors qu'elles tournent en continu.
   await pool.query(`CREATE INDEX IF NOT EXISTS idx_veille_active ON veille_subscribers (active) WHERE active = true;`);
   await pool.query(`CREATE INDEX IF NOT EXISTS idx_dossiers_status ON dossiers (status);`);
+
+  // Compteur de scans — une seule ligne, mise à jour à chaque scan. Le
+  // "ON CONFLICT DO NOTHING" évite de réinitialiser le compte à chaque
+  // redémarrage du serveur si la ligne existe déjà. Départ à 16 pour
+  // reprendre le vrai compte déjà réalisé, pas repartir de zéro.
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS site_stats (
+      id INTEGER PRIMARY KEY DEFAULT 1,
+      scan_count INTEGER NOT NULL DEFAULT 0,
+      score_sum INTEGER NOT NULL DEFAULT 0,
+      since TIMESTAMPTZ NOT NULL DEFAULT now()
+    );
+  `);
+  await pool.query(`INSERT INTO site_stats (id, scan_count, score_sum) VALUES (1, 16, 0) ON CONFLICT (id) DO NOTHING;`);
   console.log('Base de données prête (table veille_subscribers vérifiée).');
 }
 
@@ -117,20 +131,45 @@ app.use('/api/checkout', checkoutLimiter);
 app.use('/api/portal', checkoutLimiter);
 
 // --- Compteur réel, pas un chiffre inventé pour la preuve sociale ---
-// ⚠️ En mémoire : remis à zéro à chaque redémarrage du serveur. Sur le plan
-// gratuit Render, le service s'endort et redémarre après inactivité — ce
-// compteur repart donc de zéro à ce moment-là. C'est honnête tant que peu de
-// volume passe, mais il faudra le persister (fichier, ou une vraie base) dès
-// que ce chiffre doit rester fiable sur la durée.
-const stats = { scanCount: 0, scoreSum: 0, since: new Date().toISOString() };
+// Compteur de scans persistant en base de données — contrairement à un
+// simple objet en mémoire, il survit aux redémarrages du service (fréquents
+// sur le plan gratuit Render après une période d'inactivité). Repli en
+// mémoire uniquement si la base n'est pas configurée, pour ne jamais planter.
+const memStats = { scanCount: 0, scoreSum: 0, since: new Date().toISOString() };
+
+async function incrementStats(score) {
+  if (!pool) { memStats.scanCount += 1; memStats.scoreSum += score; return; }
+  try {
+    await pool.query(
+      `UPDATE site_stats SET scan_count = scan_count + 1, score_sum = score_sum + $1 WHERE id = 1`,
+      [score]
+    );
+  } catch (err) {
+    console.warn('Échec de la mise à jour du compteur de scans :', err.message);
+  }
+}
 
 const statsLimiter = rateLimit({ windowMs: 60 * 1000, max: 30 });
-app.get('/api/stats', statsLimiter, (req, res) => {
-  res.json({
-    scanCount: stats.scanCount,
-    averageScore: stats.scanCount > 0 ? Math.round(stats.scoreSum / stats.scanCount) : null,
-    since: stats.since,
-  });
+app.get('/api/stats', statsLimiter, async (req, res) => {
+  if (!pool) {
+    return res.json({
+      scanCount: memStats.scanCount,
+      averageScore: memStats.scanCount > 0 ? Math.round(memStats.scoreSum / memStats.scanCount) : null,
+      since: memStats.since,
+    });
+  }
+  try {
+    const { rows } = await pool.query(`SELECT scan_count, score_sum, since FROM site_stats WHERE id = 1`);
+    const row = rows[0] || { scan_count: 0, score_sum: 0, since: memStats.since };
+    res.json({
+      scanCount: row.scan_count,
+      averageScore: row.scan_count > 0 ? Math.round(row.score_sum / row.scan_count) : null,
+      since: row.since,
+    });
+  } catch (err) {
+    console.warn('Lecture du compteur de scans indisponible :', err.message);
+    res.json({ scanCount: memStats.scanCount, averageScore: null, since: memStats.since });
+  }
 });
 
 const STAAN_API_KEY = process.env.STAAN_API_KEY;
@@ -491,8 +530,7 @@ app.post('/api/scan', express.json({ limit: '10kb' }), async (req, res) => {
     });
   }
 
-  stats.scanCount += 1;
-  stats.scoreSum += score;
+  await incrementStats(score);
 
   // Rapport complet renvoyé directement — le scan est gratuit, pas de raison
   // de garder les vraies descriptions derrière un email. Une seule requête
