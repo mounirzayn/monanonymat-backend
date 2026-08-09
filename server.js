@@ -65,6 +65,11 @@ async function initDb() {
       paid_at TIMESTAMPTZ
     );
   `);
+  // Index sur les colonnes filtrées à chaque exécution de la tâche planifiée
+  // et par le panneau admin — sans eux, ces requêtes redeviendront lentes dès
+  // que le nombre de lignes grandira, alors qu'elles tournent en continu.
+  await pool.query(`CREATE INDEX IF NOT EXISTS idx_veille_active ON veille_subscribers (active) WHERE active = true;`);
+  await pool.query(`CREATE INDEX IF NOT EXISTS idx_dossiers_status ON dossiers (status);`);
   console.log('Base de données prête (table veille_subscribers vérifiée).');
 }
 
@@ -499,6 +504,62 @@ const EBOOK_FILES = {
   ebook_rupture: ['3-rupture-vie-privee-numerique.pdf'],
   ebook_pack: ['1-disparaitre-internet.pdf', '2-ce-quils-savent-de-vous.pdf', '3-rupture-vie-privee-numerique.pdf'],
 };
+const path = require('path');
+const fsSync = require('fs');
+// Les PDF eux-mêmes doivent être déposés dans ce dossier au moment du
+// déploiement — server.js ne les génère pas, il les sert seulement une fois
+// le paiement vérifié.
+const EBOOKS_DIR = path.join(__dirname, 'ebooks');
+
+// Téléchargement d'un ebook après paiement — jamais de fichier statique
+// public : la légitimité de la demande est vérifiée directement auprès de
+// Stripe à chaque appel, via le session_id renvoyé par l'URL de succès.
+// Sans cette vérification, n'importe qui devinant l'URL du PDF pourrait le
+// télécharger sans avoir payé.
+app.get('/api/ebook-download', scanLimiter, async (req, res) => {
+  if (!stripe) return res.status(503).json({ error: 'Paiement non configuré' });
+  const { session_id, file } = req.query;
+  if (!session_id || !file) return res.status(400).json({ error: 'Paramètres manquants' });
+
+  try {
+    const session = await stripe.checkout.sessions.retrieve(session_id);
+    if (session.payment_status !== 'paid') {
+      return res.status(403).json({ error: 'Paiement non confirmé pour cette session' });
+    }
+    const tier = session.metadata?.tier;
+    const allowedFiles = EBOOK_FILES[tier] || [];
+    if (!allowedFiles.includes(file)) {
+      return res.status(403).json({ error: 'Ce fichier ne fait pas partie de votre achat' });
+    }
+    const filePath = path.join(EBOOKS_DIR, file);
+    if (!fsSync.existsSync(filePath)) {
+      console.warn(`Ebook payé mais fichier introuvable sur le serveur : ${file}`);
+      return res.status(500).json({ error: 'Fichier temporairement indisponible — contactez-nous' });
+    }
+    res.download(filePath, file);
+  } catch (err) {
+    console.warn('Téléchargement ebook indisponible :', err.message);
+    res.status(500).json({ error: 'Impossible de vérifier ce paiement' });
+  }
+});
+
+// Liste des fichiers achetés pour une session donnée — appelé par la page de
+// succès pour savoir quels boutons de téléchargement afficher.
+app.get('/api/ebook-purchase', scanLimiter, async (req, res) => {
+  if (!stripe) return res.status(503).json({ error: 'Paiement non configuré' });
+  const { session_id } = req.query;
+  if (!session_id) return res.status(400).json({ error: 'session_id manquant' });
+  try {
+    const session = await stripe.checkout.sessions.retrieve(session_id);
+    if (session.payment_status !== 'paid') return res.status(403).json({ error: 'Paiement non confirmé' });
+    const tier = session.metadata?.tier;
+    const files = EBOOK_FILES[tier];
+    if (!files) return res.status(404).json({ error: "Cette session n'est pas un achat d'ebook" });
+    res.json({ files });
+  } catch (err) {
+    res.status(500).json({ error: 'Impossible de vérifier ce paiement' });
+  }
+});
 
 // Préparation du dossier AVANT paiement — les demandes de suppression sont
 // déjà rédigées à ce stade, pour chaque contenu du scan. Rien n'est envoyé
