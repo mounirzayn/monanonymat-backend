@@ -416,9 +416,37 @@ function relevance(item, name) {
   return 'none';
 }
 
+// --- Cache des scans (1h) ---
+// Sans lui, un nom qui devient viral sur TikTok peut épuiser le quota gratuit
+// SerpApi (250/mois) en une seule journée si beaucoup de monde tape le même
+// nom. Rien de perdu en fraîcheur : une exposition numérique ne change pas
+// à l'échelle de l'heure, donc un résultat vieux de 40 minutes est toujours
+// juste. Volontairement en mémoire, pas en base — simple, et repart à zéro
+// à chaque redémarrage, ce qui est sans conséquence ici.
+const SCAN_CACHE_TTL_MS = 60 * 60 * 1000;
+const scanCache = new Map(); // nom normalisé -> { result, expiresAt }
+function cacheKey(name) { return normalize(name); }
+function getCachedScan(name) {
+  const entry = scanCache.get(cacheKey(name));
+  if (!entry || entry.expiresAt < Date.now()) { scanCache.delete(cacheKey(name)); return null; }
+  return entry.result;
+}
+function setCachedScan(name, result) {
+  scanCache.set(cacheKey(name), { result, expiresAt: Date.now() + SCAN_CACHE_TTL_MS });
+  // Nettoyage opportuniste — évite une croissance infinie de la Map si
+  // beaucoup de noms différents sont scannés sans jamais redémarrer le serveur.
+  if (scanCache.size > 500) {
+    const now = Date.now();
+    for (const [key, val] of scanCache) if (val.expiresAt < now) scanCache.delete(key);
+  }
+}
+
 // Logique de scan partagée — appelée par /api/scan, qui renvoie directement le rapport
 // complet, avec les vraies descriptions).
 async function performScan(name) {
+  const cached = getCachedScan(name);
+  if (cached) return { ...cached, fromCache: true };
+
   const [staan, brave, serper] = await Promise.all([callStaan(name), callBrave(name), callSerpApi(name)]);
   const merged = dedupe([...staan.hits, ...brave.hits, ...serper.hits])
     .map((r) => ({ ...r, confidence: relevance(r, name) }))
@@ -427,10 +455,15 @@ async function performScan(name) {
   const hardStop = hasHardStopSignal(merged);
   const classified = classify(merged);
   const score = computeScore(classified);
-  return {
+  const result = {
     classified, score, partial, hardStop,
     coverage: { staan: staan.status, brave: brave.status, google: serper.status },
   };
+  // On ne met en cache que les scans complets et sans signal d'urgence — un
+  // hardStop ne doit jamais être servi depuis un cache, et un scan partiel
+  // (source tombée) ne doit pas figer une panne temporaire pendant une heure.
+  if (!hardStop && !partial) setCachedScan(name, result);
+  return result;
 }
 
 app.post('/api/scan', express.json({ limit: '10kb' }), async (req, res) => {
@@ -874,6 +907,10 @@ app.post('/api/cron/rescan-veille', async (req, res) => {
 // suffisant tant qu'ils sont traités manuellement, mais à stocker aussi en
 // base le jour où leur suivi doit être consultable après un redémarrage.
 const confirmedPayments = { count: 0 };
+// Suivi des événements Stripe déjà traités — voir le webhook plus bas pour
+// le pourquoi. En mémoire, comme le cache de scan : suffisant ici, un
+// événement Stripe n'est jamais renvoyé plusieurs jours après coup.
+const processedStripeEvents = new Set();
 const STRIPE_WEBHOOK_SECRET = process.env.STRIPE_WEBHOOK_SECRET;
 
 // Webhook Stripe — la vraie source de vérité pour savoir si un paiement a
@@ -1017,6 +1054,24 @@ app.post('/api/stripe-webhook', express.raw({ type: 'application/json' }), async
     // On rejette sans donner de détail exploitable dans la réponse.
     console.warn('Signature du webhook Stripe invalide :', err.message);
     return res.status(400).send('Signature invalide');
+  }
+
+  // Stripe peut renvoyer un même événement plusieurs fois — c'est documenté
+  // et normal de leur côté (ex. si notre réponse a mis trop de temps à
+  // arriver la première fois), pas une attaque. Sans cette vérification, un
+  // renvoi légitime pourrait créer un deuxième mois d'essai offert, un
+  // deuxième abonnement Veille, ou activer un dossier une deuxième fois.
+  if (processedStripeEvents.has(event.id)) {
+    console.log(`Événement Stripe ${event.id} déjà traité — ignoré (renvoi normal de Stripe).`);
+    return res.json({ received: true, duplicate: true });
+  }
+  processedStripeEvents.add(event.id);
+  if (processedStripeEvents.size > 1000) {
+    // Purge simple : on ne garde pas un historique infini, un événement Stripe
+    // n'est de toute façon jamais renvoyé après plusieurs jours.
+    const excess = processedStripeEvents.size - 1000;
+    let i = 0;
+    for (const id of processedStripeEvents) { if (i++ >= excess) break; processedStripeEvents.delete(id); }
   }
 
   if (event.type === 'checkout.session.completed') {
