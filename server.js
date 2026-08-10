@@ -189,6 +189,33 @@ const SENSITIVE_HINTS = [
 // de hachage (NCMEC/Take It Down, PHAROS...), jamais sur un classifieur maison.
 const HARD_STOP_HINTS = ['mineur', 'enfant', 'collégien', 'lycéen', ' ado '];
 
+// Personnalités publiques et chefs d'État — le service est pensé pour
+// l'exposition numérique d'un particulier sur sa propre vie, pas comme outil
+// de recherche sur des figures publiques. Liste non exhaustive par nature
+// (impossible de couvrir tous les pays et l'actualité politique en continu) —
+// à compléter avec le temps plutôt qu'un filtre parfait dès le départ.
+// Vérifiée en août 2026 pour les postes ayant récemment changé (Canada,
+// Syrie notamment).
+const PUBLIC_FIGURE_NAMES = [
+  // Chefs d'État / de gouvernement actuels (grands pays, France en priorité)
+  'emmanuel macron', 'donald trump', 'vladimir poutine', 'xi jinping',
+  'kim jong-un', 'kim jong un', 'narendra modi', 'recep tayyip erdogan',
+  'volodymyr zelensky', 'volodymyr zelenskyy', 'benjamin netanyahu',
+  'mohammed bin salman', 'ahmed al-charaa', 'ahmad al-charaa',
+  'mark carney', 'charles iii', 'roi charles', 'keir starmer',
+  'friedrich merz', 'giorgia meloni', 'pedro sanchez', 'luiz inacio lula',
+  'lula da silva', 'javier milei', 'olaf scholz',
+  // Dictateurs historiques largement reconnus, sans ambiguïté
+  'adolf hitler', 'joseph staline', 'josef staline', 'pol pot',
+  'benito mussolini', 'mao zedong', 'idi amin', 'nicolae ceausescu',
+  'francisco franco', 'saddam hussein', 'mouammar kadhafi', 'muammar kadhafi',
+  'bachar al-assad', 'bachar al assad',
+];
+function isPublicFigure(name) {
+  const normName = normalize(name);
+  return PUBLIC_FIGURE_NAMES.some((figure) => normName === normalize(figure));
+}
+
 async function callStaan(name) {
   if (!STAAN_API_KEY) { console.warn('STAAN_API_KEY absente — source Staan ignorée'); return { hits: [], status: 'no_key' }; }
   try {
@@ -509,6 +536,12 @@ app.post('/api/scan', express.json({ limit: '10kb' }), async (req, res) => {
   const name = (req.body?.name || '').trim();
   if (!name || name.length < 2 || name.length > 80) {
     return res.status(400).json({ error: 'Nom invalide' });
+  }
+  if (isPublicFigure(name)) {
+    return res.status(403).json({
+      error: 'public_figure',
+      message: "Ce service est réservé à l'exposition numérique d'un particulier sur sa propre vie — pas comme outil de recherche sur des personnalités publiques ou des chefs d'État.",
+    });
   }
 
   const { classified, score, partial, hardStop, coverage } = await performScan(name);
