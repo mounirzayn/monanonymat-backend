@@ -210,6 +210,10 @@ const PUBLIC_FIGURE_NAMES = [
   'benito mussolini', 'mao zedong', 'idi amin', 'nicolae ceausescu',
   'francisco franco', 'saddam hussein', 'mouammar kadhafi', 'muammar kadhafi',
   'bachar al-assad', 'bachar al assad',
+  // Autres figures mondialement connues, hors chefs d'État, où la même
+  // logique s'applique (pas un particulier vérifiant sa propre exposition)
+  'oussama ben laden', 'ben laden', 'ousama ben laden',
+  'abou bakr al-baghdadi',
 ];
 function isPublicFigure(name) {
   const normName = normalize(name);
