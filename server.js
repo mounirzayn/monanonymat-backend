@@ -1036,12 +1036,16 @@ function base64url(buffer) {
 // image n'est jamais stockée côté serveur — reçue en mémoire, transmise à
 // Hive, puis immédiatement oubliée.
 //
-// ⚠️ Intégration construite à partir de la documentation publique Hive
-// (format de réponse : output[].classes avec yes_deepfake/no_deepfake et un
-// score de confiance par visage détecté). L'endpoint exact et le format
-// d'authentification sont à revérifier sur https://docs.thehive.ai au
-// moment de configurer une vraie clé — cette intégration n'a pas encore été
-// testée en conditions réelles, faute de clé disponible.
+// Endpoint et format de réponse confirmés via un vrai test dans l'aire de
+// jeux du compte Hive (modèle hive/ai-generated-and-deepfake-content-
+// detection) : la réponse contient output[0].classes, une liste plate de
+// classes avec un score par classe (ai_generated, deepfake, et une classe
+// par générateur précis comme stablediffusionxl, midjourney...) — pas de
+// détection par visage avec coordonnées comme le laissait supposer la doc
+// V2 publique. Seul point encore non confirmé : le format exact attendu en
+// entrée (JSON avec URL média, ou upload binaire direct comme codé
+// ci-dessous) — à vérifier lors du premier vrai test une fois la clé
+// configurée.
 const deepfakeLimiter = rateLimit({ windowMs: 60 * 1000, max: 10 });
 app.post('/api/deepfake-check', deepfakeLimiter, upload.single('image'), async (req, res) => {
   if (!HIVE_API_KEY) {
@@ -1062,7 +1066,13 @@ app.post('/api/deepfake-check', deepfakeLimiter, upload.single('image'), async (
     // bord Hive). Endpoint à confirmer dans l'espace "Aire de jeux" du
     // compte Hive — celui-ci est une hypothèse raisonnable, pas une valeur
     // vérifiée en conditions réelles.
-    const hiveRes = await fetch('https://api.thehive.ai/api/v3/deepfake-detection', {
+    // Endpoint mis à jour à partir du nom de modèle réellement visible dans
+    // l'aire de jeux de son compte Hive (thehive.ai/models/hive/
+    // ai-generated-and-deepfake-content-detection) — suit le même schéma
+    // fournisseur/modèle que la documentation V3 de génération d'images.
+    // Format de requête encore à confirmer précisément (JSON avec URL média,
+    // ou upload binaire direct) — voir la note plus bas.
+    const hiveRes = await fetch('https://api.thehive.ai/api/v3/hive/ai-generated-and-deepfake-content-detection', {
       method: 'POST',
       headers: { Authorization: `Bearer ${HIVE_API_KEY}` },
       body: form,
@@ -1074,18 +1084,41 @@ app.post('/api/deepfake-check', deepfakeLimiter, upload.single('image'), async (
     }
 
     const data = await hiveRes.json();
-    const faces = data?.status?.[0]?.response?.output?.[0]?.bounding_poly || [];
-    const deepfakeFace = faces.find((f) =>
-      f.classes?.some((c) => c.class === 'yes_deepfake' && c.score > 0.5)
+    const classes = data?.output?.[0]?.classes || [];
+    const getScore = (name) => classes.find((c) => c.class === name)?.value ?? null;
+
+    const aiGenerated = getScore('ai_generated');
+    const deepfake = getScore('deepfake');
+
+    // La liste contient aussi une classe par générateur précis (sora,
+    // midjourney, stablediffusionxl...) — utile pour préciser la source si
+    // le score global est élevé, comme le fait l'aire de jeux Hive elle-même.
+    const generatorClasses = classes.filter((c) =>
+      !['not_ai_generated', 'ai_generated', 'deepfake', 'none', 'inconclusive', 'inconclusive_video', 'not_ai_generated_audio', 'ai_generated_audio'].includes(c.class)
     );
-    const confidence = deepfakeFace
-      ? deepfakeFace.classes.find((c) => c.class === 'yes_deepfake').score
-      : (faces[0]?.classes?.find((c) => c.class === 'no_deepfake')?.score ?? null);
+    const topGenerator = generatorClasses.reduce((max, c) => (c.value > (max?.value ?? -1) ? c : max), null);
+
+    let verdict, confidence;
+    if (deepfake !== null && deepfake > 0.5) {
+      verdict = 'deepfake_probable';
+      confidence = deepfake;
+    } else if (aiGenerated !== null && aiGenerated > 0.5) {
+      verdict = 'generee_par_ia_probable';
+      confidence = aiGenerated;
+    } else if (aiGenerated !== null) {
+      verdict = 'authentique_probable';
+      confidence = 1 - aiGenerated;
+    } else {
+      verdict = 'resultat_indisponible';
+      confidence = null;
+    }
 
     res.json({
-      facesDetected: faces.length,
-      verdict: deepfakeFace ? 'deepfake_probable' : (faces.length > 0 ? 'authentique_probable' : 'aucun_visage'),
-      confidence: confidence !== null ? Math.round(confidence * 100) : null,
+      verdict,
+      confidence: confidence !== null ? Math.round(confidence * 10000) / 100 : null,
+      topGenerator: (verdict === 'generee_par_ia_probable' && topGenerator && topGenerator.value > 0.3)
+        ? { name: topGenerator.class, confidence: Math.round(topGenerator.value * 10000) / 100 }
+        : null,
     });
   } catch (err) {
     console.warn('Erreur lors de l\'analyse deepfake :', err.message);
