@@ -88,6 +88,19 @@ async function initDb() {
 }
 
 const app = express();
+
+// Upload en mémoire uniquement — jamais écrit sur disque, jamais conservé.
+// L'image transite vers Hive pour analyse puis est immédiatement oubliée,
+// cohérent avec le principe "rien n'est gardé" du reste du site.
+const multer = require('multer');
+const upload = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: 12 * 1024 * 1024 }, // 12 Mo max
+  fileFilter: (req, file, cb) => {
+    const allowed = ['image/jpeg', 'image/png', 'image/webp'];
+    cb(null, allowed.includes(file.mimetype));
+  },
+});
 // Render est derrière un proxy inverse — sans ce réglage, express-rate-limit
 // ne peut pas identifier correctement chaque visiteur via X-Forwarded-For.
 app.set('trust proxy', 1);
@@ -173,6 +186,7 @@ app.get('/api/stats', statsLimiter, async (req, res) => {
 });
 
 const STAAN_API_KEY = process.env.STAAN_API_KEY;
+const HIVE_API_KEY = process.env.HIVE_API_KEY;
 const BRAVE_API_KEY = process.env.BRAVE_API_KEY;
 
 // Premier tri "sensible / pas sensible" par mots-clés. À affiner sérieusement
@@ -1015,6 +1029,64 @@ function cleanupExpiredXSessions() {
 function base64url(buffer) {
   return buffer.toString('base64').replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
 }
+
+// --- Vérification deepfake (Hive AI) ---
+// Même principe que Staan/Brave/SerpApi : si HIVE_API_KEY n'est pas
+// configurée, on le dit clairement plutôt que de faire semblant. Aucune
+// image n'est jamais stockée côté serveur — reçue en mémoire, transmise à
+// Hive, puis immédiatement oubliée.
+//
+// ⚠️ Intégration construite à partir de la documentation publique Hive
+// (format de réponse : output[].classes avec yes_deepfake/no_deepfake et un
+// score de confiance par visage détecté). L'endpoint exact et le format
+// d'authentification sont à revérifier sur https://docs.thehive.ai au
+// moment de configurer une vraie clé — cette intégration n'a pas encore été
+// testée en conditions réelles, faute de clé disponible.
+const deepfakeLimiter = rateLimit({ windowMs: 60 * 1000, max: 10 });
+app.post('/api/deepfake-check', deepfakeLimiter, upload.single('image'), async (req, res) => {
+  if (!HIVE_API_KEY) {
+    return res.status(503).json({
+      error: 'no_key',
+      message: "Cette fonctionnalité n'est pas encore activée — revenez bientôt.",
+    });
+  }
+  if (!req.file) {
+    return res.status(400).json({ error: 'missing_file', message: 'Aucune image reçue.' });
+  }
+  try {
+    const form = new FormData();
+    form.append('image', new Blob([req.file.buffer], { type: req.file.mimetype }), 'upload.jpg');
+
+    const hiveRes = await fetch('https://api.thehive.ai/api/v2/task/sync', {
+      method: 'POST',
+      headers: { Authorization: `Token ${HIVE_API_KEY}` },
+      body: form,
+    });
+
+    if (!hiveRes.ok) {
+      console.warn(`Hive a répondu ${hiveRes.status} lors d'une analyse deepfake.`);
+      return res.status(502).json({ error: 'analysis_failed', message: "L'analyse n'a pas pu aboutir — réessayez dans un instant." });
+    }
+
+    const data = await hiveRes.json();
+    const faces = data?.status?.[0]?.response?.output?.[0]?.bounding_poly || [];
+    const deepfakeFace = faces.find((f) =>
+      f.classes?.some((c) => c.class === 'yes_deepfake' && c.score > 0.5)
+    );
+    const confidence = deepfakeFace
+      ? deepfakeFace.classes.find((c) => c.class === 'yes_deepfake').score
+      : (faces[0]?.classes?.find((c) => c.class === 'no_deepfake')?.score ?? null);
+
+    res.json({
+      facesDetected: faces.length,
+      verdict: deepfakeFace ? 'deepfake_probable' : (faces.length > 0 ? 'authentique_probable' : 'aucun_visage'),
+      confidence: confidence !== null ? Math.round(confidence * 100) : null,
+    });
+  } catch (err) {
+    console.warn('Erreur lors de l\'analyse deepfake :', err.message);
+    res.status(500).json({ error: 'analysis_failed', message: "L'analyse n'a pas pu aboutir — réessayez dans un instant." });
+  }
+});
 
 app.get('/api/x/auth-url', scanLimiter, (req, res) => {
   if (!X_CLIENT_ID) return res.status(503).json({ error: "Nettoyage X non configuré (X_CLIENT_ID absente)" });
