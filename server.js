@@ -1036,16 +1036,17 @@ function base64url(buffer) {
 // image n'est jamais stockée côté serveur — reçue en mémoire, transmise à
 // Hive, puis immédiatement oubliée.
 //
-// Endpoint et format de réponse confirmés via un vrai test dans l'aire de
-// jeux du compte Hive (modèle hive/ai-generated-and-deepfake-content-
-// detection) : la réponse contient output[0].classes, une liste plate de
-// classes avec un score par classe (ai_generated, deepfake, et une classe
-// par générateur précis comme stablediffusionxl, midjourney...) — pas de
-// détection par visage avec coordonnées comme le laissait supposer la doc
-// V2 publique. Seul point encore non confirmé : le format exact attendu en
-// entrée (JSON avec URL média, ou upload binaire direct comme codé
-// ci-dessous) — à vérifier lors du premier vrai test une fois la clé
-// configurée.
+// Endpoint, authentification, format de requête (JSON + base64) et format
+// de réponse tous confirmés via la documentation officielle du modèle exact
+// (docs.thehive.ai/docs/ai-generated-and-deepfake-content-detection-playground)
+// — plus aucune hypothèse à ce stade. Seuils de décision (0,9) également
+// alignés sur la recommandation officielle de Hive, pas une valeur choisie
+// arbitrairement.
+//
+// ⚠️ Limite réelle à connaître : le plan gratuit "Playground" est limité à
+// 100 requêtes par jour, partagées entre tous les visiteurs du site (pas
+// par personne) — pas de garde-fou automatique côté code pour ce plafond
+// précis, seulement la limite de débit habituelle par adresse IP.
 const deepfakeLimiter = rateLimit({ windowMs: 60 * 1000, max: 10 });
 app.post('/api/deepfake-check', deepfakeLimiter, upload.single('image'), async (req, res) => {
   if (!HIVE_API_KEY) {
@@ -1058,24 +1059,24 @@ app.post('/api/deepfake-check', deepfakeLimiter, upload.single('image'), async (
     return res.status(400).json({ error: 'missing_file', message: 'Aucune image reçue.' });
   }
   try {
-    const form = new FormData();
-    form.append('image', new Blob([req.file.buffer], { type: req.file.mimetype }), 'upload.jpg');
+    // Format confirmé par la documentation officielle du modèle exact
+    // (docs.thehive.ai/docs/ai-generated-and-deepfake-content-detection-playground) :
+    // JSON avec l'image encodée en base64, pas de multipart. Endpoint et
+    // authentification également confirmés par cette même page — plus
+    // aucune hypothèse à ce stade.
+    const base64Data = req.file.buffer.toString('base64');
+    const mediaDataUri = `data:${req.file.mimetype};base64,${base64Data}`;
 
-    // V3 : authentification par Bearer avec la Clé secrète uniquement (pas
-    // l'Access Key ID, qui ne sert qu'à identifier la clé dans le tableau de
-    // bord Hive). Endpoint à confirmer dans l'espace "Aire de jeux" du
-    // compte Hive — celui-ci est une hypothèse raisonnable, pas une valeur
-    // vérifiée en conditions réelles.
-    // Endpoint mis à jour à partir du nom de modèle réellement visible dans
-    // l'aire de jeux de son compte Hive (thehive.ai/models/hive/
-    // ai-generated-and-deepfake-content-detection) — suit le même schéma
-    // fournisseur/modèle que la documentation V3 de génération d'images.
-    // Format de requête encore à confirmer précisément (JSON avec URL média,
-    // ou upload binaire direct) — voir la note plus bas.
     const hiveRes = await fetch('https://api.thehive.ai/api/v3/hive/ai-generated-and-deepfake-content-detection', {
       method: 'POST',
-      headers: { Authorization: `Bearer ${HIVE_API_KEY}` },
-      body: form,
+      headers: {
+        Authorization: `Bearer ${HIVE_API_KEY}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        media_metadata: true,
+        input: [{ media_base64: mediaDataUri }],
+      }),
     });
 
     if (!hiveRes.ok) {
@@ -1099,10 +1100,12 @@ app.post('/api/deepfake-check', deepfakeLimiter, upload.single('image'), async (
     const topGenerator = generatorClasses.reduce((max, c) => (c.value > (max?.value ?? -1) ? c : max), null);
 
     let verdict, confidence;
-    if (deepfake !== null && deepfake > 0.5) {
+    // Seuils recommandés officiellement par Hive pour un résultat fiable
+    // (pas 0,5 arbitraire) — voir la section "Thresholds" de leur doc.
+    if (deepfake !== null && deepfake >= 0.9) {
       verdict = 'deepfake_probable';
       confidence = deepfake;
-    } else if (aiGenerated !== null && aiGenerated > 0.5) {
+    } else if (aiGenerated !== null && aiGenerated >= 0.9) {
       verdict = 'generee_par_ia_probable';
       confidence = aiGenerated;
     } else if (aiGenerated !== null) {
