@@ -1057,9 +1057,14 @@ app.post('/api/deepfake-check', deepfakeLimiter, upload.single('image'), async (
     const form = new FormData();
     form.append('image', new Blob([req.file.buffer], { type: req.file.mimetype }), 'upload.jpg');
 
-    const hiveRes = await fetch('https://api.thehive.ai/api/v2/task/sync', {
+    // V3 : authentification par Bearer avec la Clé secrète uniquement (pas
+    // l'Access Key ID, qui ne sert qu'à identifier la clé dans le tableau de
+    // bord Hive). Endpoint à confirmer dans l'espace "Aire de jeux" du
+    // compte Hive — celui-ci est une hypothèse raisonnable, pas une valeur
+    // vérifiée en conditions réelles.
+    const hiveRes = await fetch('https://api.thehive.ai/api/v3/deepfake-detection', {
       method: 'POST',
-      headers: { Authorization: `Token ${HIVE_API_KEY}` },
+      headers: { Authorization: `Bearer ${HIVE_API_KEY}` },
       body: form,
     });
 
