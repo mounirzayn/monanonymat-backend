@@ -478,13 +478,20 @@ function normalize(str) {
   return (str || '').normalize('NFD').replace(/[\u0300-\u036f]/g, '').toLowerCase();
 }
 
-// Niveau de confiance, en trois échelons plutôt qu'un simple oui/non :
-//  - 'high'   : la phrase (quasi) exacte apparaît telle quelle, ou les mots du
-//               nom sont collés les uns aux autres (< 25 caractères d'écart)
-//  - 'medium' : tous les mots du nom sont présents mais plus espacés dans le
-//               texte (jusqu'à 60 caractères) — probable mais moins certain
-//  - 'none'   : rejeté (un mot manque, ou les mots sont trop loin les uns des
-//               autres pour qu'on soit sûr qu'ils parlent de la même personne)
+// Niveau de confiance, en deux échelons désormais — 'high' ou rejeté :
+//  - 'high'   : la phrase (quasi) exacte apparaît telle quelle, ou les mots
+//               du nom se suivent immédiatement (à une virgule/tiret près) —
+//               exactement comme un nom complet s'écrit réellement
+//  - 'none'   : rejeté (un mot manque, ou les mots ne se suivent pas — signe
+//               que deux personnes différentes sont mentionnées dans le même
+//               texte plutôt qu'une seule)
+//
+// Avant, un palier "medium" acceptait les mots du nom dispersés à moins de
+// 60 caractères l'un de l'autre, n'importe où dans le texte. Problème réel
+// signalé en production : "Jean Martin a félicité Sophie Dupont" contient
+// bien "Jean" et "Dupont" à moins de 60 caractères — et remontait à tort
+// comme un résultat concernant "Jean Dupont", alors qu'il s'agit de deux
+// personnes sans aucun rapport. Exiger l'adjacence élimine ce faux positif.
 function relevance(item, name) {
   const text = normalize(`${item.title || ''} ${item.snippet || ''}`);
   const normName = normalize(name);
@@ -492,11 +499,17 @@ function relevance(item, name) {
   if (words.length === 0) return 'none';
   if (!words.every((w) => text.includes(w))) return 'none';
   if (text.includes(normName)) return 'high'; // phrase exacte telle quelle
-  if (words.length === 1) return 'medium';
-  const positions = words.map((w) => text.indexOf(w));
-  const spread = Math.max(...positions) - Math.min(...positions);
-  if (spread <= 25) return 'high';
-  if (spread <= 60) return 'medium';
+  if (words.length === 1) return 'high'; // un seul mot déjà vérifié présent ci-dessus
+
+  const escaped = words.map((w) => w.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'));
+  // Les mots doivent se suivre directement, dans l'ordre du nom recherché OU
+  // inversé (ex: "Dupont Jean" dans un annuaire) — jamais dispersés ailleurs
+  // dans la phrase. Un léger séparateur (espace, virgule, tiret) est toléré.
+  const sep = '[\\s,.\\-]{1,3}';
+  const forward = new RegExp(escaped.join(sep));
+  const reversed = new RegExp(escaped.slice().reverse().join(sep));
+  if (forward.test(text) || reversed.test(text)) return 'high';
+
   return 'none';
 }
 
