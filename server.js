@@ -22,6 +22,27 @@ const helmet = require('helmet');
 const { Pool } = require('pg');
 require('dotenv').config();
 
+// --- Filet de sécurité global ---
+// Sans ça, une erreur non prévue n'importe où dans le code (un bug pas
+// encore découvert, un souci temporaire de connexion) fait planter TOUT le
+// serveur d'un coup — pas juste la requête concernée — et souvent sans
+// laisser de trace claire dans les logs Render.
+process.on('unhandledRejection', (reason) => {
+  // Une promesse a échoué sans être rattrapée quelque part. On le
+  // journalise clairement pour pouvoir enquêter, sans faire tomber le
+  // serveur pour autant — la plupart de ces cas sont bénins.
+  console.error('Rejet de promesse non traité :', reason);
+});
+
+process.on('uncaughtException', (err) => {
+  // Ici, l'état du processus n'est plus garanti fiable — on journalise puis
+  // on arrête proprement plutôt que de continuer à tourner dans un état
+  // imprévisible. Render redémarre automatiquement un processus neuf dans
+  // la foulée.
+  console.error('Exception non interceptée — arrêt propre du serveur :', err);
+  process.exit(1);
+});
+
 // --- Base de données (PostgreSQL) ---
 // Nécessaire pour que la Veille soit un vrai service automatisé : sans
 // mémoire durable, impossible de savoir qui est abonné et quel était son
@@ -1061,11 +1082,32 @@ function base64url(buffer) {
 // par personne) — pas de garde-fou automatique côté code pour ce plafond
 // précis, seulement la limite de débit habituelle par adresse IP.
 const deepfakeLimiter = rateLimit({ windowMs: 60 * 1000, max: 10 });
+
+// Le plan gratuit Hive est plafonné à 100 requêtes/jour, partagées entre
+// tous les visiteurs (pas par personne). Sans ce compteur, une fois le
+// quota atteint, Hive renvoie une erreur brute peu claire pour qui tombe
+// dessus. Compteur en mémoire, remis à zéro chaque jour — approximatif si
+// le serveur redémarre en cours de journée, mais évite l'essentiel des cas.
+let hiveCallsToday = 0;
+let hiveCallsResetAt = new Date().setHours(24, 0, 0, 0);
+function hiveQuotaAvailable() {
+  if (Date.now() >= hiveCallsResetAt) {
+    hiveCallsToday = 0;
+    hiveCallsResetAt = new Date().setHours(24, 0, 0, 0);
+  }
+  return hiveCallsToday < 95; // marge de 5 sous le vrai plafond de 100
+}
 app.post('/api/deepfake-check', deepfakeLimiter, upload.single('image'), async (req, res) => {
   if (!HIVE_API_KEY) {
     return res.status(503).json({
       error: 'no_key',
       message: "Cette fonctionnalité n'est pas encore activée — revenez bientôt.",
+    });
+  }
+  if (!hiveQuotaAvailable()) {
+    return res.status(503).json({
+      error: 'quota_exceeded',
+      message: "Trop de vérifications aujourd'hui — réessayez demain, ou contactez-nous directement pour un cas urgent.",
     });
   }
   if (!req.file) {
@@ -1080,6 +1122,7 @@ app.post('/api/deepfake-check', deepfakeLimiter, upload.single('image'), async (
     const base64Data = req.file.buffer.toString('base64');
     const mediaDataUri = `data:${req.file.mimetype};base64,${base64Data}`;
 
+    hiveCallsToday++;
     const hiveRes = await fetch('https://api.thehive.ai/api/v3/hive/ai-generated-and-deepfake-content-detection', {
       method: 'POST',
       headers: {
