@@ -645,7 +645,7 @@ const stripe = STRIPE_SECRET_KEY ? new Stripe(STRIPE_SECRET_KEY) : null;
 const OFFERS = {
   ponctuelle: { name: 'Suppression ponctuelle', amount: 14900, mode: 'payment' },
   veille: { name: 'Veille & Protection (mensuel)', amount: 1900, mode: 'subscription', interval: 'month' },
-  veille_annuel: { name: 'Veille & Protection (annuel)', amount: 19000, mode: 'subscription', interval: 'year' },
+  veille_annuel: { name: 'Veille & Protection (annuel)', amount: 18000, mode: 'subscription', interval: 'year' },
   premium: { name: 'Accompagnement Premium', amount: 34900, mode: 'payment' },
   ebook_disparaitre: { name: 'Ebook — Disparaître d\'internet', amount: 900, mode: 'payment' },
   ebook_savent: { name: 'Ebook — Ce qu\'ils savent de vous', amount: 900, mode: 'payment' },
@@ -1404,6 +1404,132 @@ app.post('/api/stripe-webhook', express.raw({ type: 'application/json' }), async
   }
 
   res.json({ received: true });
+});
+
+// --- Demandes RGPD : envoi automatique par e-mail (page effacer-mes-donnees) ---
+// Fonctionnement, sans rien stocker :
+//  1. /api/demandes/code : on envoie un code à 6 chiffres à l'e-mail de
+//     l'utilisateur. Le code est un HMAC(e-mail + tranche de 10 min) : aucune
+//     base de données nécessaire, et il survit à la mise en veille de Render.
+//  2. /api/demandes/envoyer : si le code est bon, on envoie chaque lettre au
+//     DPO du service, avec l'utilisateur en adresse de réponse, puis un
+//     récapitulatif à l'utilisateur. Le contenu des lettres n'est jamais
+//     stocké ni écrit dans les logs.
+// Garde-fous : destinataires limités à une liste blanche de DPO vérifiés
+// (impossible de s'en servir pour écrire à n'importe qui), e-mail de
+// l'utilisateur vérifié (impossible d'agir au nom d'un autre), plafonds
+// de taille, de nombre et de fréquence.
+const DEMANDES_SECRET = process.env.DEMANDES_SECRET || process.env.CRON_SECRET || process.env.ADMIN_SECRET || crypto.randomBytes(32).toString('hex');
+const DPO_EMAILS = {
+  google: 'dpo-google@google.com', youtube: 'dpo-google@google.com',
+  snapchat: 'dpo@snap.com', amazon: 'eu-privacy@amazon.fr', bouygues: 'data@bouyguestelecom.fr',
+  discord: 'privacy@discord.com', reddit: 'redditdatarequests@reddit.com',
+  pinterest: 'privacy-support@pinterest.com', twitch: 'privacy@twitch.tv',
+  shein: 'privacy@sheingroup.com', spotify: 'privacy@spotify.com', netflix: 'privacy@netflix.com',
+  chatgpt: 'privacy@openai.com', leboncoin: 'dpo@newgeneralcompany.com', temu: 'privacy@eur.temu.com',
+  airbnb: 'dpo@airbnb.com', booking: 'dataprotectionoffice@booking.com', uber: 'dpo@uber.com',
+  free: 'dpo@iliad.fr', freemobile: 'dpo@iliad.fr',
+};
+const EMAIL_RE = /^[^\s@<>"']{1,64}@[^\s@<>"']{1,190}\.[a-z]{2,24}$/i;
+const CODE_WINDOW_MS = 10 * 60 * 1000;
+function demandeCode(email, windowIndex) {
+  const h = crypto.createHmac('sha256', DEMANDES_SECRET).update(`${email.toLowerCase()}|${windowIndex}`).digest();
+  return String(h.readUInt32BE(0) % 1000000).padStart(6, '0');
+}
+function demandeCodeValide(email, code) {
+  const w = Math.floor(Date.now() / CODE_WINDOW_MS);
+  const c = String(code || '').replace(/\D/g, '');
+  if (c.length !== 6) return false;
+  return safeCompare(c, demandeCode(email, w)) || safeCompare(c, demandeCode(email, w - 1));
+}
+function escHtml(t) {
+  return String(t).replace(/[&<>"']/g, (ch) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[ch]));
+}
+async function brevoSend(payload) {
+  const res = await fetch('https://api.brevo.com/v3/smtp/email', {
+    method: 'POST',
+    headers: { 'api-key': BREVO_API_KEY, 'Content-Type': 'application/json', Accept: 'application/json' },
+    body: JSON.stringify({ sender: { name: BREVO_SENDER_NAME, email: BREVO_SENDER_EMAIL }, ...payload }),
+  });
+  return res.ok;
+}
+const demandesCodeLimiter = rateLimit({ windowMs: 10 * 60 * 1000, max: 4 });
+const demandesSendLimiter = rateLimit({ windowMs: 60 * 60 * 1000, max: 5 });
+
+app.post('/api/demandes/code', demandesCodeLimiter, express.json({ limit: '2kb' }), async (req, res) => {
+  const email = String(req.body?.email || '').trim();
+  if (!EMAIL_RE.test(email)) return res.status(400).json({ error: 'email_invalide' });
+  if (!BREVO_API_KEY || !BREVO_SENDER_EMAIL) return res.status(503).json({ error: 'envoi_indisponible' });
+  const code = demandeCode(email, Math.floor(Date.now() / CODE_WINDOW_MS));
+  try {
+    const ok = await brevoSend({
+      to: [{ email }],
+      subject: `Votre code de confirmation : ${code}`,
+      htmlContent: `<p>Voici votre code pour confirmer l'envoi de vos demandes RGPD depuis monanonymat.fr :</p><p style="font-size:28px;font-weight:700;letter-spacing:4px">${code}</p><p>Il est valable environ 10 minutes. Si vous n'êtes pas à l'origine de cette demande, ignorez ce message : rien ne sera envoyé.</p>`,
+    });
+    if (!ok) return res.status(502).json({ error: 'envoi_echec' });
+    res.json({ sent: true });
+  } catch (err) {
+    console.warn('Brevo (code demandes) indisponible :', err.message);
+    res.status(502).json({ error: 'envoi_echec' });
+  }
+});
+
+app.post('/api/demandes/envoyer', demandesSendLimiter, express.json({ limit: '400kb' }), async (req, res) => {
+  const email = String(req.body?.email || '').trim();
+  const name = String(req.body?.name || '').trim().slice(0, 120);
+  const letters = Array.isArray(req.body?.letters) ? req.body.letters : [];
+  if (!EMAIL_RE.test(email) || name.length < 2) return res.status(400).json({ error: 'infos_invalides' });
+  if (!demandeCodeValide(email, req.body?.code)) return res.status(403).json({ error: 'code_invalide' });
+  if (!letters.length || letters.length > 40) return res.status(400).json({ error: 'nombre_invalide' });
+  if (!BREVO_API_KEY || !BREVO_SENDER_EMAIL) return res.status(503).json({ error: 'envoi_indisponible' });
+
+  const seen = new Set();
+  const clean = [];
+  for (const l of letters) {
+    const key = String(l?.key || '');
+    const subject = String(l?.subject || '').trim();
+    const body = String(l?.body || '').trim();
+    if (!DPO_EMAILS[key] || seen.has(key)) continue;
+    if (!subject || subject.length > 200 || !body || body.length > 12000) continue;
+    seen.add(key);
+    clean.push({ key, to: DPO_EMAILS[key], subject, body });
+  }
+  if (!clean.length) return res.status(400).json({ error: 'aucune_lettre_valide' });
+
+  const notice = `Message transmis par le service monanonymat.fr à la demande de ${name} (${email}), dont l'adresse e-mail a été vérifiée. Merci de répondre directement à cette personne : votre réponse lui parviendra en cliquant sur « Répondre ».\n\n----------------------------------------\n\n`;
+  const results = [];
+  for (const l of clean) {
+    let ok = false;
+    try {
+      ok = await brevoSend({
+        to: [{ email: l.to }],
+        replyTo: { email, name },
+        subject: l.subject,
+        textContent: notice + l.body,
+      });
+    } catch (err) {
+      console.warn(`Brevo (demande ${l.key}) indisponible :`, err.message);
+    }
+    results.push({ key: l.key, ok });
+  }
+
+  const sentOnes = clean.filter((l, i) => results[i].ok);
+  if (sentOnes.length) {
+    try {
+      await brevoSend({
+        to: [{ email, name }],
+        subject: `Vos ${sentOnes.length} demande(s) RGPD ont été envoyées`,
+        htmlContent: `<p>Bonjour ${escHtml(name)},</p><p>Vos demandes ont été envoyées le ${new Date().toLocaleDateString('fr-FR')}. Les services ont un mois pour vous répondre. Leurs réponses arriveront directement dans cette boîte mail. Gardez ce message : c'est votre preuve d'envoi.</p>`
+          + sentOnes.map((l) => `<hr><p><b>Destinataire :</b> ${escHtml(l.to)}<br><b>Objet :</b> ${escHtml(l.subject)}</p><pre style="white-space:pre-wrap;font-family:Georgia,serif">${escHtml(l.body)}</pre>`).join('')
+          + `<hr><p>Sans réponse dans un mois, préparez une relance sur https://monanonymat.fr/effacer-mes-donnees.html</p>`,
+      });
+    } catch (err) {
+      console.warn('Brevo (récapitulatif demandes) indisponible :', err.message);
+    }
+  }
+  console.log(`Demandes RGPD : ${sentOnes.length}/${clean.length} envoyée(s).`);
+  res.json({ results });
 });
 
 const PORT = process.env.PORT || 3000;
