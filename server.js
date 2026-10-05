@@ -647,10 +647,11 @@ const OFFERS = {
   veille: { name: 'Veille & Protection (mensuel)', amount: 1900, mode: 'subscription', interval: 'month' },
   veille_annuel: { name: 'Veille & Protection (annuel)', amount: 18000, mode: 'subscription', interval: 'year' },
   premium: { name: 'Accompagnement Premium', amount: 34900, mode: 'payment' },
-  ebook_disparaitre: { name: 'Ebook — Disparaître d\'internet', amount: 900, mode: 'payment' },
-  ebook_savent: { name: 'Ebook — Ce qu\'ils savent de vous', amount: 900, mode: 'payment' },
-  ebook_rupture: { name: 'Ebook — Rupture et vie privée numérique', amount: 900, mode: 'payment' },
-  ebook_pack: { name: 'Pack des 3 ebooks', amount: 1900, mode: 'payment' },
+  // Soutien volontaire (section « Me soutenir » du site) : paiement unique,
+  // sans contrepartie. Les ebooks ne sont plus vendus.
+  soutien_5: { name: 'Soutien à monanonymat.fr', amount: 500, mode: 'payment' },
+  soutien_10: { name: 'Soutien à monanonymat.fr', amount: 1000, mode: 'payment' },
+  soutien_20: { name: 'Soutien à monanonymat.fr', amount: 2000, mode: 'payment' },
 };
 
 // Fichiers réellement livrés pour chaque offre ebook — utilisé après paiement
@@ -1451,6 +1452,12 @@ async function brevoSend(payload) {
     headers: { 'api-key': BREVO_API_KEY, 'Content-Type': 'application/json', Accept: 'application/json' },
     body: JSON.stringify({ sender: { name: BREVO_SENDER_NAME, email: BREVO_SENDER_EMAIL }, ...payload }),
   });
+  if (!res.ok) {
+    // Raison exacte du refus dans les logs Render (clé invalide, IP non
+    // autorisée, expéditeur non validé...), sans jamais écrire le contenu.
+    const detail = await res.json().catch(() => ({}));
+    console.warn(`Brevo a refusé l'envoi (HTTP ${res.status}) : ${detail.code || ''} ${detail.message || ''}`.trim());
+  }
   return res.ok;
 }
 const demandesCodeLimiter = rateLimit({ windowMs: 10 * 60 * 1000, max: 4 });
@@ -1459,7 +1466,10 @@ const demandesSendLimiter = rateLimit({ windowMs: 60 * 60 * 1000, max: 5 });
 app.post('/api/demandes/code', demandesCodeLimiter, express.json({ limit: '2kb' }), async (req, res) => {
   const email = String(req.body?.email || '').trim();
   if (!EMAIL_RE.test(email)) return res.status(400).json({ error: 'email_invalide' });
-  if (!BREVO_API_KEY || !BREVO_SENDER_EMAIL) return res.status(503).json({ error: 'envoi_indisponible' });
+  if (!BREVO_API_KEY || !BREVO_SENDER_EMAIL) {
+    console.warn('Envoi du code impossible : BREVO_API_KEY ou BREVO_SENDER_EMAIL absente sur Render.');
+    return res.status(503).json({ error: 'envoi_indisponible' });
+  }
   const code = demandeCode(email, Math.floor(Date.now() / CODE_WINDOW_MS));
   try {
     const ok = await brevoSend({
