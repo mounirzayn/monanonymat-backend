@@ -823,7 +823,18 @@ app.post('/api/admin/dossiers/:id/status', express.json({ limit: '1kb' }), async
 app.post('/api/checkout', express.json({ limit: '10kb' }), async (req, res) => {
   if (!stripe) return res.status(503).json({ error: 'Paiement non configuré (STRIPE_SECRET_KEY absente)' });
   const { tier, ref, name, dossier_id } = req.body || {};
-  const offer = OFFERS[tier];
+  let offer = OFFERS[tier];
+  // Don à montant libre : seul cas où le montant vient du visiteur. Il est
+  // strictement borné (1 € à 500 €) et ne donne accès à aucun produit ni
+  // service, donc rien à frauder.
+  if (tier === 'soutien_libre') {
+    const euros = Number(String(req.body?.amount ?? '').replace(',', '.'));
+    const cents = Math.round(euros * 100);
+    if (!Number.isFinite(euros) || cents < 100 || cents > 50000) {
+      return res.status(400).json({ error: 'Montant invalide (entre 1 € et 500 €)' });
+    }
+    offer = { name: 'Don à monanonymat.fr', amount: cents, mode: 'payment' };
+  }
   if (!offer) return res.status(400).json({ error: 'Offre inconnue' });
   const isVeille = tier === 'veille' || tier === 'veille_annuel';
   if (isVeille && (!name || name.trim().length < 2)) {
